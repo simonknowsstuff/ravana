@@ -2,6 +2,7 @@ import { useRef, useState, useEffect, useCallback } from 'react'
 import { Canvas, useThree, useFrame } from '@react-three/fiber'
 import { OrbitControls } from '@react-three/drei'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
+import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js'
 import * as THREE from 'three'
 
 interface CameraData {
@@ -121,6 +122,12 @@ function SceneContent({ file, onCameraFound, onCameraSave, savedCameraRef, camer
     }
 
     const loader = new GLTFLoader()
+    
+    // Set up DRACO loader for compressed geometries
+    const dracoLoader = new DRACOLoader()
+    dracoLoader.setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.6/')
+    loader.setDRACOLoader(dracoLoader)
+    
     const url = URL.createObjectURL(file)
 
     loader.load(

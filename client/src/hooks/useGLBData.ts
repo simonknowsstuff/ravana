@@ -1,5 +1,6 @@
 import { useState, useCallback } from 'react'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
+import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js'
 import * as THREE from 'three'
 import { BakedData, BakeOptions, bakeMeshWithBVH, buildFlatBVH } from './useBVH'
 
@@ -77,6 +78,12 @@ export async function extractGLBData(
   bakeOptions: BakeOptions = defaultBakeOptions
 ): Promise<GLBData> {
   const loader = new GLTFLoader()
+  
+  // Set up DRACO loader for compressed geometries
+  const dracoLoader = new DRACOLoader()
+  dracoLoader.setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.6/')
+  loader.setDRACOLoader(dracoLoader)
+  
   const url = URL.createObjectURL(file)
   
   try {
