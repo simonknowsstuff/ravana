@@ -123,6 +123,9 @@ function App() {
   const [savedCameraData, setSavedCameraData] = useState<CameraData | null>(null)
   const [showViewer, setShowViewer] = useState(true)
   
+  // File input ref (to reset after clearing)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
   // WebSocket state
   const socketRef = useRef<Socket | null>(null)
   const [isConnected, setIsConnected] = useState(false)
@@ -246,6 +249,10 @@ function App() {
     setFileName('')
     setCurrentFile(null)
     setSavedCameraData(null)
+    // Reset the file input so onChange fires even for the same file
+    if (fileInputRef.current) {
+      fileInputRef.current.value = ''
+    }
   }, [])
 
   const handleCameraSave = useCallback((cameraData: CameraData) => {
@@ -254,6 +261,17 @@ function App() {
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900 relative flex flex-col">
+      {/* Full-screen Loading Overlay */}
+      {isLoading && (
+        <div className="fixed inset-0 z-50 bg-slate-900/90 backdrop-blur-sm flex items-center justify-center">
+          <div className="text-center">
+            <div className="w-16 h-16 mx-auto border-4 border-purple-500 border-t-transparent rounded-full animate-spin mb-6"></div>
+            <h2 className="text-2xl font-semibold text-white mb-2">Processing File</h2>
+            <p className="text-slate-400">{bakingProgress || 'Loading...'}</p>
+          </div>
+        </div>
+      )}
+
       {/* Golden Grid Overlay */}
       <div 
         className="absolute inset-0 pointer-events-none"
@@ -295,6 +313,7 @@ function App() {
             `}
           >
             <input
+              ref={fileInputRef}
               type="file"
               accept=".gltf,.glb"
               onChange={handleInputChange}
