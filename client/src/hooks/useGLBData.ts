@@ -24,6 +24,8 @@ export interface MergedSceneData {
   normals: Float32Array
   /** Per-vertex emissive RGB [r,g,b, ...] in 0-1 sRGB (self-illumination, ignores lighting) */
   emissive: Float32Array
+  /** Per-vertex ambient occlusion [ao, ...] in 0-1 (modulates ambient lighting) */
+  ambientOcclusion: Float32Array
 }
 
 /** A light extracted from the GLB scene */
@@ -321,7 +323,9 @@ export async function extractGLBData(
     const mergedNormals = new Float32Array(totalPositionFloats)
     // Per-vertex emissive RGB (3 floats per vertex)
     const mergedEmissive = new Float32Array(totalPositionFloats)
-    let posOff = 0, idxOff = 0, vertBase = 0
+    // Per-vertex ambient occlusion (1 float per vertex)
+    const mergedAO = new Float32Array(totalPositionFloats / 3) // one AO value per vertex
+    let posOff = 0, idxOff = 0, vertBase = 0, aoOff = 0
     
     for (let mi = 0; mi < meshes.length; mi++) {
       const m = meshes[mi]
@@ -329,6 +333,7 @@ export async function extractGLBData(
       const emissiveColor = meshEmissiveColors[mi] || new THREE.Color(0, 0, 0)
       const vcolors = meshVertexColors[mi] // per-vertex colors (sRGB) or null
       const wnormals = meshWorldNormals[mi] // world-space normals or null
+      const bakedAO = m.bakedData?.ambientOcclusion || null
       mergedPositions.set(m.positions, posOff)
       // Fill per-vertex colors: prefer geometry vertex colors, fall back to material
       const vertCount = m.positions.length / 3
@@ -350,11 +355,12 @@ export async function extractGLBData(
           mergedNormals[posOff + vi * 3 + 1] = wnormals[vi * 3 + 1]
           mergedNormals[posOff + vi * 3 + 2] = wnormals[vi * 3 + 2]
         }
-        // else: mergedNormals is already zero-filled → raytracer treats (0,0,0) as "no smooth normal"
         // Emissive (flat per-mesh material emissive)
         mergedEmissive[posOff + vi * 3]     = emissiveColor.r
         mergedEmissive[posOff + vi * 3 + 1] = emissiveColor.g
         mergedEmissive[posOff + vi * 3 + 2] = emissiveColor.b
+        // Ambient Occlusion (per-vertex from baked data or 1.0 default)
+        mergedAO[aoOff + vi] = bakedAO ? bakedAO[vi] : 1.0
       }
       if (m.indices) {
         for (let i = 0; i < m.indices.length; i++) {
@@ -363,7 +369,8 @@ export async function extractGLBData(
         idxOff += m.indices.length
       }
       posOff += m.positions.length
-      vertBase += m.positions.length / 3
+      aoOff += vertCount
+      vertBase += vertCount
     }
     
     const { bvhBuffer, indices: bvhIndices } = buildFlatBVH(mergedPositions, mergedIndices)
@@ -375,6 +382,7 @@ export async function extractGLBData(
       colors: mergedColors,
       normals: mergedNormals,
       emissive: mergedEmissive,
+      ambientOcclusion: mergedAO,
     }
     
     const extractedTriCount = totalIndexUints / 3

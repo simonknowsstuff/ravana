@@ -9,6 +9,7 @@ interface GeometryCache {
   colors: Float32Array;
   normals: Float32Array;
   emissive: Float32Array;
+  ao: Float32Array;
 }
 
 export default function WorkerNode() {
@@ -71,8 +72,11 @@ export default function WorkerNode() {
         const emissive = m.emissiveLength > 0
           ? new Float32Array(rawBuffer.slice(m.emissiveOffset, m.emissiveOffset + m.emissiveLength))
           : new Float32Array(0);
+        const ao = m.aoLength > 0
+          ? new Float32Array(rawBuffer.slice(m.aoOffset, m.aoOffset + m.aoLength))
+          : new Float32Array(0);
 
-        geoCacheRef.current = { positions, indices, bvhBuffer, colors, normals, emissive };
+        geoCacheRef.current = { positions, indices, bvhBuffer, colors, normals, emissive, ao };
         
         const vertCount = positions.length / 3;
         const triCount = indices.length / 3;
@@ -92,6 +96,7 @@ export default function WorkerNode() {
             colors: geoCacheRef.current.colors,
             normals: geoCacheRef.current.normals,
             emissive: geoCacheRef.current.emissive,
+            ao: geoCacheRef.current.ao,
             cameraPos: queued.camera?.cameraPos,
             viewMatrix: queued.camera?.viewMatrix,
             fov: queued.camera?.fov,
@@ -129,6 +134,7 @@ export default function WorkerNode() {
         colors: geoCacheRef.current.colors,
         normals: geoCacheRef.current.normals,
         emissive: geoCacheRef.current.emissive,
+        ao: geoCacheRef.current.ao,
         cameraPos: task.camera?.cameraPos,
         viewMatrix: task.camera?.viewMatrix,
         fov: task.camera?.fov,

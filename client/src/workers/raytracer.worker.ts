@@ -23,6 +23,7 @@ interface WorkerPayload {
   colors?: Float32Array;
   normals?: Float32Array;
   emissive?: Float32Array;
+  ao?: Float32Array;
   lights?: LightDef[];
   startX: number; startY: number; width: number; height: number;
   canvasWidth: number; canvasHeight: number;
@@ -39,16 +40,17 @@ self.onmessage = (event: MessageEvent<WorkerPayload | any>) => {
   let colors: Float32Array | undefined;
   let normals: Float32Array | undefined;
   let emissive: Float32Array | undefined;
+  let ao: Float32Array | undefined;
   let lights: LightDef[] = [];
   let startX:number, startY:number, width:number, height:number, canvasWidth:number, canvasHeight:number;
   let fov: number | undefined;
   let cameraPos: Vector3 | undefined, viewMatrix: number[] | undefined, sunDir: Vector3 | undefined;
 
   if (event.data.camera) {
-    ({ positions, bvhBuffer, indices, colors, normals, emissive, lights, startX, startY, width, height, canvasWidth, canvasHeight } = event.data);
+    ({ positions, bvhBuffer, indices, colors, normals, emissive, ao, lights, startX, startY, width, height, canvasWidth, canvasHeight } = event.data);
     ({ cameraPos, viewMatrix, fov, sunDir } = event.data.camera);
   } else {
-    ({ positions, bvhBuffer, indices, colors, normals, emissive, lights, startX, startY, width, height, canvasWidth, canvasHeight, fov, cameraPos, viewMatrix, sunDir } = event.data);
+    ({ positions, bvhBuffer, indices, colors, normals, emissive, ao, lights, startX, startY, width, height, canvasWidth, canvasHeight, fov, cameraPos, viewMatrix, sunDir } = event.data);
   }
   lights = lights || [];
 
@@ -149,7 +151,7 @@ self.onmessage = (event: MessageEvent<WorkerPayload | any>) => {
         }
       }
 
-      // ── Shading ──
+      // ── Shading (PBR with GGX microfacet) ──
       if (closestT < Infinity) {
         // Hit point
         const hitP: Vector3 = {
@@ -164,7 +166,6 @@ self.onmessage = (event: MessageEvent<WorkerPayload | any>) => {
           const nA: Vector3 = { x: normals[hitA], y: normals[hitA+1], z: normals[hitA+2] };
           const nB: Vector3 = { x: normals[hitB], y: normals[hitB+1], z: normals[hitB+2] };
           const nC: Vector3 = { x: normals[hitC], y: normals[hitC+1], z: normals[hitC+2] };
-          // Check that normals are non-zero (zero = no smooth data available)
           const lenA = nA.x*nA.x + nA.y*nA.y + nA.z*nA.z;
           const lenB = nB.x*nB.x + nB.y*nB.y + nB.z*nB.z;
           const lenC = nC.x*nC.x + nC.y*nC.y + nC.z*nC.z;
@@ -179,11 +180,9 @@ self.onmessage = (event: MessageEvent<WorkerPayload | any>) => {
         }
 
         // Ensure normals face camera
-        // Geometric face normal — always used for shadow bias (robust against smooth normal artifacts)
         const geoN = dot(hitNormal, rd) > 0
           ? { x: -hitNormal.x, y: -hitNormal.y, z: -hitNormal.z }
           : hitNormal;
-        // Smooth shading normal — used for lighting appearance
         const N = dot(shadingNormal, rd) > 0
           ? { x: -shadingNormal.x, y: -shadingNormal.y, z: -shadingNormal.z }
           : shadingNormal;
@@ -197,31 +196,42 @@ self.onmessage = (event: MessageEvent<WorkerPayload | any>) => {
           }
         }
 
-        // Accumulate lighting from all lights
-        let totalR = 0, totalG = 0, totalB = 0;
-        const ambient = 0.12;
-        totalR += albR * ambient;
-        totalG += albG * ambient;
-        totalB += albB * ambient;
+        // Fetch AO (multiply into ambient)
+        let aoFactor = 1.0;
+        if (ao && ao.length > 0) {
+          if (hitVertA < ao.length) {
+            aoFactor = ao[hitVertA];
+          }
+        }
 
+        // Material properties (can be enhanced with textures later)
+        const roughness = 0.5;  // 0=mirror, 1=diffuse
+        const metallic = 0.0;   // 0=dielectric, 1=metal
+        const F0 = metallic > 0.5 ? { r: 0.9, g: 0.9, b: 0.9 } : { r: 0.04, g: 0.04, b: 0.04 };
+
+        // Accumulate lighting
+        let totalR = 0, totalG = 0, totalB = 0;
+        const ambientStrength = 0.15 * aoFactor;
+        totalR += albR * ambientStrength;
+        totalG += albG * ambientStrength;
+        totalB += albB * ambientStrength;
+
+        // ─── PBR Light Loop ───
         for (const light of lights) {
-          let L: Vector3;       // direction from hit to light
+          let L: Vector3;
           let lightDist: number;
           let attenuation = 1.0;
           let spotFactor = 1.0;
 
           if (light.type === 'directional') {
-            // Direction is from light towards scene — flip for shading
             L = normalize({ x: -light.direction.x, y: -light.direction.y, z: -light.direction.z });
             lightDist = 1e6;
             attenuation = light.intensity;
           } else {
-            // Point or Spot
             const toLight = sub(light.position, hitP);
             lightDist = Math.sqrt(dot(toLight, toLight));
             L = { x: toLight.x / lightDist, y: toLight.y / lightDist, z: toLight.z / lightDist };
 
-            // Distance attenuation (physically based)
             if (light.distance > 0 && lightDist > light.distance) {
               attenuation = 0;
             } else {
@@ -229,31 +239,27 @@ self.onmessage = (event: MessageEvent<WorkerPayload | any>) => {
               attenuation = light.intensity / Math.max(1, Math.pow(lightDist, decay));
             }
 
-            // Spot cone attenuation
             if (light.type === 'spot' && light.angle > 0) {
               const spotDir = normalize(light.direction);
-              const cosAngle = -dot(L, spotDir); // angle between -L and spot direction
+              const cosAngle = -dot(L, spotDir);
               const cosCone = Math.cos(light.angle);
               const cosPenumbra = Math.cos(light.angle * (1 - light.penumbra));
               if (cosAngle < cosCone) {
                 spotFactor = 0;
               } else if (cosAngle < cosPenumbra) {
                 spotFactor = (cosAngle - cosCone) / (cosPenumbra - cosCone);
-                spotFactor = spotFactor * spotFactor; // smooth
+                spotFactor = spotFactor * spotFactor;
               }
             }
           }
 
           if (attenuation * spotFactor < 0.001) continue;
 
-          // Geometric NdotL for termination (avoids terminator artifacts on smooth surfaces)
           const geoNdotL = dot(geoN, L);
-          // Smooth NdotL for shading
           const NdotL = Math.max(0, dot(N, L));
-          // Skip if both geometric and smooth normals face away from light
           if (geoNdotL <= 0 && NdotL <= 0) continue;
 
-          // Shadow test — bias along GEOMETRIC face normal for robust self-shadow avoidance
+          // Shadow test
           const shadowOrigin: Vector3 = {
             x: hitP.x + geoN.x * SHADOW_EPSILON,
             y: hitP.y + geoN.y * SHADOW_EPSILON,
@@ -261,28 +267,65 @@ self.onmessage = (event: MessageEvent<WorkerPayload | any>) => {
           };
           if (isOccluded(shadowOrigin, L, lightDist)) continue;
 
-          const diffuse = NdotL * attenuation * spotFactor;
-
-          // Specular (Blinn-Phong)
           const V = normalize(sub(cameraPos!, hitP));
           const H = normalize({ x: L.x + V.x, y: L.y + V.y, z: L.z + V.z });
-          const NdotH = Math.max(0, dot(N, H));
-          const specular = Math.pow(NdotH, 32) * attenuation * spotFactor * 0.3;
+          const NdotH = Math.max(0.001, dot(N, H));
+          const VdotH = Math.max(0.001, dot(V, H));
+          const NdotV = Math.max(0.001, dot(N, V));
 
-          totalR += albR * light.color.r * diffuse + light.color.r * specular;
-          totalG += albG * light.color.g * diffuse + light.color.g * specular;
-          totalB += albB * light.color.b * diffuse + light.color.b * specular;
+          // ─── GGX Microfacet Specular ───
+          const alpha = roughness * roughness;
+          const alpha2 = alpha * alpha;
+          const denom = NdotH * NdotH * (alpha2 - 1.0) + 1.0;
+          const D = alpha2 / (denom * denom * 3.14159);
+
+          // Fresnel (Schlick approximation)
+          const fresnel = (a: number) => a + (1.0 - a) * Math.pow(Math.max(0, 1.0 - VdotH), 5.0);
+          const F = {
+            r: fresnel(F0.r),
+            g: fresnel(F0.g),
+            b: fresnel(F0.b)
+          };
+
+          // Geometry (Schlick-GGX)
+          const k = (roughness + 1.0) * (roughness + 1.0) / 8.0;
+          const G = 1.0 / (NdotV * (1.0 - k) + k) / (NdotL * (1.0 - k) + k);
+
+          // Cook-Torrance specular
+          const specBrdf = D * F.r * G / Math.max(0.001, 4.0 * NdotV * NdotL);
+          const specR = specBrdf * attenuation * spotFactor;
+          const specG = (D * F.g * G / Math.max(0.001, 4.0 * NdotV * NdotL)) * attenuation * spotFactor;
+          const specB = (D * F.b * G / Math.max(0.001, 4.0 * NdotV * NdotL)) * attenuation * spotFactor;
+
+          // Diffuse (Lambertian, kd = 1 - metallic)
+          const kd = 1.0 - metallic;
+          const diffuseBrdf = NdotL * attenuation * spotFactor;
+
+          totalR += (albR * kd * diffuseBrdf / 3.14159) * light.color.r + specR * light.color.r;
+          totalG += (albG * kd * diffuseBrdf / 3.14159) * light.color.g + specG * light.color.g;
+          totalB += (albB * kd * diffuseBrdf / 3.14159) * light.color.b + specB * light.color.b;
         }
 
-        // If no scene lights contributed (fallback sun), add a soft directional
+        // Fallback sun
         if (lights.length === 0) {
           const NdotS = Math.max(0, dot(N, sunDir!));
-          totalR += albR * NdotS * 0.6 + albR * 0.3;
-          totalG += albG * NdotS * 0.6 + albG * 0.3;
-          totalB += albB * NdotS * 0.6 + albB * 0.3;
+          const V = normalize(sub(cameraPos!, hitP));
+          const H = normalize({ x: sunDir!.x + V.x, y: sunDir!.y + V.y, z: sunDir!.z + V.z });
+          const NdotH = Math.max(0.001, dot(N, H));
+          const VdotH = Math.max(0.001, dot(V, H));
+          
+          const alpha = roughness * roughness;
+          const alpha2 = alpha * alpha;
+          const denom = NdotH * NdotH * (alpha2 - 1.0) + 1.0;
+          const D = alpha2 / (denom * denom * 3.14159);
+          
+          const sunSpec = D * 0.04 * NdotH * 0.5;
+          totalR += (albR * NdotS * 0.6 + sunSpec) * 0.8;
+          totalG += (albG * NdotS * 0.6 + sunSpec) * 0.8;
+          totalB += (albB * NdotS * 0.6 + sunSpec) * 0.8;
         }
 
-        // Add emissive (self-illumination — independent of lighting / shadows)
+        // Add emissive
         if (emissive && emissive.length > 0) {
           const ei = hitVertA * 3;
           if (ei + 2 < emissive.length) {
@@ -292,11 +335,20 @@ self.onmessage = (event: MessageEvent<WorkerPayload | any>) => {
           }
         }
 
-        // Tone-map (simple Reinhard) and gamma correct
-        const tonemap = (v: number) => v / (v + 1);
-        pixels[pixelIdx++] = Math.min(255, Math.round(tonemap(totalR) * 255));
-        pixels[pixelIdx++] = Math.min(255, Math.round(tonemap(totalG) * 255));
-        pixels[pixelIdx++] = Math.min(255, Math.round(tonemap(totalB) * 255));
+        // ─── ACES Tone Mapping + Gamma ───
+        const acesTonemap = (v: number) => {
+          const a = 2.51;
+          const b = 0.03;
+          const c = 2.43;
+          const d = 0.59;
+          const e = 0.14;
+          return (v * (a * v + b)) / (v * (c * v + d) + e);
+        };
+        const gamma = (v: number) => Math.pow(Math.max(0, v), 1.0 / 2.2);
+
+        pixels[pixelIdx++] = Math.min(255, Math.round(gamma(acesTonemap(totalR)) * 255));
+        pixels[pixelIdx++] = Math.min(255, Math.round(gamma(acesTonemap(totalG)) * 255));
+        pixels[pixelIdx++] = Math.min(255, Math.round(gamma(acesTonemap(totalB)) * 255));
         pixels[pixelIdx++] = 255;
       } else {
         // Sky gradient

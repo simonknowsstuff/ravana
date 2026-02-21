@@ -54,6 +54,7 @@ function compileSceneData(glbData: GLBData, cameraData: CameraData | null): { me
   const mergedColOff = mergedBvhOff + merged.bvhData.byteLength
   const mergedNrmOff = mergedColOff + merged.colors.byteLength
   const mergedEmiOff = mergedNrmOff + merged.normals.byteLength
+  const mergedAoOff = mergedEmiOff + merged.emissive.byteLength
   const mergedMeta = {
     positionsOffset: mergedPosOff,
     positionsLength: merged.positions.byteLength,
@@ -67,8 +68,10 @@ function compileSceneData(glbData: GLBData, cameraData: CameraData | null): { me
     normalsLength: merged.normals.byteLength,
     emissiveOffset: mergedEmiOff,
     emissiveLength: merged.emissive.byteLength,
+    aoOffset: mergedAoOff,
+    aoLength: merged.ambientOcclusion.byteLength,
   }
-  totalBytes += merged.positions.byteLength + merged.indices.byteLength + merged.bvhData.byteLength + merged.colors.byteLength + merged.normals.byteLength + merged.emissive.byteLength
+  totalBytes += merged.positions.byteLength + merged.indices.byteLength + merged.bvhData.byteLength + merged.colors.byteLength + merged.normals.byteLength + merged.emissive.byteLength + merged.ambientOcclusion.byteLength
   
   // Create the binary buffer
   const buffer = new ArrayBuffer(totalBytes)
@@ -128,6 +131,8 @@ function compileSceneData(glbData: GLBData, cameraData: CameraData | null): { me
   offset += merged.normals.byteLength
   view.set(new Uint8Array(merged.emissive.buffer, merged.emissive.byteOffset, merged.emissive.byteLength), offset)
   offset += merged.emissive.byteLength
+  view.set(new Uint8Array(merged.ambientOcclusion.buffer, merged.ambientOcclusion.byteOffset, merged.ambientOcclusion.byteLength), offset)
+  offset += merged.ambientOcclusion.byteLength
   
   const metadata: ScenePayload = {
     timestamp: Date.now(),
