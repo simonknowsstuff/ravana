@@ -123,6 +123,9 @@ function App() {
   const [savedCameraData, setSavedCameraData] = useState<CameraData | null>(null)
   const [showViewer, setShowViewer] = useState(true)
   
+  // File input ref (to reset after clearing)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
   // WebSocket state
   const socketRef = useRef<Socket | null>(null)
   const [isConnected, setIsConnected] = useState(false)
@@ -244,6 +247,10 @@ function App() {
     setFileName('')
     setCurrentFile(null)
     setSavedCameraData(null)
+    // Reset the file input so onChange fires even for the same file
+    if (fileInputRef.current) {
+      fileInputRef.current.value = ''
+    }
   }, [])
 
   const handleCameraSave = useCallback((cameraData: CameraData) => {
@@ -293,6 +300,7 @@ function App() {
             `}
           >
             <input
+              ref={fileInputRef}
               type="file"
               accept=".gltf,.glb"
               onChange={handleInputChange}
