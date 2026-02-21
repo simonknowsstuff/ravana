@@ -1,16 +1,16 @@
 import { useEffect, useState, useRef } from 'react';
 import { io, Socket } from 'socket.io-client';
 
-// Define the shape of our geometry cache
 interface GeometryCache {
   positions: Float32Array;
-  bvhBuffer: Float32Array;
   indices: Uint32Array;
+  bvhBuffer: Float32Array;
 }
 
 export default function WorkerNode() {
   const [status, setStatus] = useState<string>('Connecting to Swarm...');
   const [tilesProcessed, setTilesProcessed] = useState<number>(0);
+  const [isConnected, setIsConnected] = useState(false);
   
   const socketRef = useRef<Socket | null>(null);
   const workerRef = useRef<Worker | null>(null);
@@ -18,45 +18,70 @@ export default function WorkerNode() {
 
   useEffect(() => {
     // 1. INITIALIZE THE PHYSICS ENGINE (Web Worker)
-    // Using Vite's standard syntax for importing web workers
     workerRef.current = new Worker(new URL('./raytracer.worker.ts', import.meta.url), { 
       type: 'module' 
     });
 
-    // 2. CONNECT TO THE TRAFFIC COP (Node.js Server)
-    // Replace with your actual local IP address running the server
-    const socket = io('http://192.168.1.X:3000'); 
+    // 2. CONNECT TO THE SERVER
+    // Make sure this matches your laptop's local IP address on the hackathon Wi-Fi
+    const serverUrl = import.meta.env.VITE_WS_SERVER_URL || 'http://localhost:3001';
+    const socket = io(serverUrl);
     socketRef.current = socket;
 
     socket.on('connect', () => {
-      setStatus('Connected. Awaiting Orders.');
+      setIsConnected(true);
+      setStatus('Connected. Awaiting payload...');
       socket.emit('register_worker');
     });
 
-    // 3. RECEIVE THE HEAVY PAYLOAD (Once per render)
+    socket.on('disconnect', () => {
+      setIsConnected(false);
+      setStatus('Lost connection to Swarm.');
+    });
+
+    // 3. THE UNPACKER: Catch the binary payload and slice it up
     socket.on('sync_geometry', (payload) => {
-      setStatus('Downloading Geometry Payload...');
+      setStatus('Downloading Geometry...');
       
-      // Socket.io sends binary data as raw ArrayBuffers. 
-      // We MUST wrap them back into their Typed Arrays before the Worker can use them.
+      const { metadata, buffer } = payload;
+      
+      // For the demo, we grab the first mesh from the metadata map
+      const meshMeta = metadata.geometry.meshes[0];
+
+      if (!meshMeta) {
+        setStatus('Error: Empty payload received.');
+        return;
+      }
+
+      // CRITICAL: We use buffer.slice() to copy the memory. 
+      // This guarantees the new TypedArrays are byte-aligned in the phone's RAM.
+      const positionsBuffer = buffer.slice(meshMeta.positionsOffset, meshMeta.positionsOffset + meshMeta.positionsLength);
+      const bvhBufferSliced = buffer.slice(meshMeta.bvhOffset, meshMeta.bvhOffset + meshMeta.bvhLength);
+      
+      let indicesBuffer = new ArrayBuffer(0);
+      if (meshMeta.indicesLength > 0) {
+        indicesBuffer = buffer.slice(meshMeta.indicesOffset, meshMeta.indicesOffset + meshMeta.indicesLength);
+      }
+
+      // Reconstruct the TypedArrays from the sliced raw memory
       geoCacheRef.current = {
-        positions: new Float32Array(payload.positions),
-        bvhBuffer: new Float32Array(payload.bvhBuffer),
-        indices: new Uint32Array(payload.indices)
+        positions: new Float32Array(positionsBuffer),
+        bvhBuffer: new Float32Array(bvhBufferSliced), // The BVH tree is back!
+        indices: new Uint32Array(indicesBuffer)
       };
       
-      setStatus('Payload Cached. Ready to crunch.');
+      setStatus('Geometry Cached. Ready to crunch.');
     });
 
     // 4. RECEIVE A MICRO-CHUNK TASK
     socket.on('assign_tile', (task) => {
       if (!geoCacheRef.current) {
-        console.error("Received task, but have no geometry cache!");
-        // We will address this trap below
+        console.warn("Received tile task, but missing geometry cache.");
+        // Optional: emit an event asking the server to resend the geometry
         return;
       }
 
-      setStatus(`Crunching Chunk [${task.startX}, ${task.startY}]...`);
+      setStatus(`Crunching tile [${task.startX}, ${task.startY}]...`);
 
       // Combine the tiny task coordinates with our heavy geometry cache
       // and send it all into the isolated Worker thread
@@ -82,10 +107,10 @@ export default function WorkerNode() {
       });
 
       setTilesProcessed((prev) => prev + 1);
-      setStatus('Chunk complete. Requesting next...');
+      setStatus('Tile complete. Requesting next...');
     };
 
-    // Cleanup on unmount
+    // Cleanup
     return () => {
       socket.disconnect();
       workerRef.current?.terminate();
@@ -93,15 +118,27 @@ export default function WorkerNode() {
   }, []);
 
   return (
-    <div className="min-h-screen bg-slate-900 flex flex-col items-center justify-center p-6 text-center">
-      <div className="w-24 h-24 mb-8 rounded-full border-4 border-purple-500 border-t-transparent animate-spin"></div>
+    <div className="min-h-screen bg-slate-900 flex flex-col items-center justify-center p-6 text-center font-sans">
+      <div className={`w-24 h-24 mb-8 rounded-full border-4 border-t-transparent animate-spin ${isConnected ? 'border-cyan-500' : 'border-slate-600'}`}></div>
       
-      <h1 className="text-3xl font-bold text-white mb-2">Shard Node</h1>
-      <p className="text-purple-400 font-mono text-xl mb-8">{status}</p>
+      <h1 className="text-4xl font-bold text-white mb-3 tracking-tight">Shard Node</h1>
+      <p className="text-cyan-400 font-mono text-lg mb-10 h-6">{status}</p>
       
-      <div className="bg-slate-800 rounded-xl p-6 w-full max-w-sm border border-slate-700">
-        <h2 className="text-slate-400 text-sm uppercase tracking-wider mb-2">My Contribution</h2>
-        <p className="text-5xl font-black text-white">{tilesProcessed} <span className="text-lg text-slate-500 font-normal">tiles</span></p>
+      <div className="bg-slate-800 rounded-2xl p-8 w-full max-w-sm border border-slate-700 shadow-xl relative overflow-hidden">
+        {/* Futuristic glowing accent */}
+        <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-cyan-500 via-purple-500 to-cyan-500 opacity-50"></div>
+        
+        <h2 className="text-slate-400 text-xs font-bold uppercase tracking-widest mb-3">Compute Contribution</h2>
+        <div className="flex items-baseline justify-center space-x-2">
+          <p className="text-7xl font-black text-white">{tilesProcessed}</p>
+          <span className="text-xl text-slate-500 font-medium">tiles</span>
+        </div>
+      </div>
+
+      {/* Connection Indicator */}
+      <div className="mt-12 flex items-center space-x-2 opacity-50">
+        <div className={`w-2 h-2 rounded-full ${isConnected ? 'bg-green-500' : 'bg-red-500'}`}></div>
+        <span className="text-slate-400 text-sm font-mono">{isConnected ? 'Uplink Established' : 'Offline'}</span>
       </div>
     </div>
   );

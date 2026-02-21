@@ -165,6 +165,16 @@ function App() {
         metadata,
         buffer,
       })
+
+      // 2. THE SPARK: Tell the server to create the queue and start the Swarm
+      socketRef.current.emit('start_render', {
+        canvasWidth: 800,
+        canvasHeight: 450,
+        // Make sure your savedCameraData has these!
+        cameraPos: savedCameraData?.position,
+        viewMatrix: savedCameraData?.viewMatrix || [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1], 
+        sunDir: { x: 0.5, y: 1.0, z: 0.5 }
+      })
       
       setLastSentPayload(metadata)
       console.log('[socket] sent scene payload:', metadata)
