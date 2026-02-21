@@ -32,6 +32,7 @@ interface MeshData {
   uvs: Float32Array | null
   indices: Uint16Array | Uint32Array | null
   bakedData?: BakedData
+  bvhData?: Uint8Array // Serialized BVH tree for raytracing
 }
 
 interface GLBData {
@@ -61,6 +62,7 @@ interface ScenePayload {
       hasNormals: boolean
       hasUvs: boolean
       hasBakedData: boolean
+      hasBvhData: boolean
       // Byte offsets in the binary buffer
       positionsOffset: number
       positionsLength: number
@@ -74,8 +76,41 @@ interface ScenePayload {
       aoLength: number
       vertexColorsOffset: number
       vertexColorsLength: number
+      bvhOffset: number
+      bvhLength: number
     }>
   }
+}
+
+// Serialize MeshBVH to a compact Uint8Array for transmission
+function serializeBVH(bvh: MeshBVH): Uint8Array {
+  const serialized = MeshBVH.serialize(bvh)
+  
+  // Combine all roots into a single buffer with a header
+  // Header: [rootCount (4 bytes)] + [rootLengths (4 bytes each)]
+  const rootCount = serialized.roots.length
+  const headerSize = 4 + rootCount * 4
+  const totalRootsSize = serialized.roots.reduce((sum, root) => sum + root.byteLength, 0)
+  
+  const result = new Uint8Array(headerSize + totalRootsSize)
+  const view = new DataView(result.buffer)
+  
+  // Write header
+  view.setUint32(0, rootCount, true) // little-endian
+  let headerOffset = 4
+  for (const root of serialized.roots) {
+    view.setUint32(headerOffset, root.byteLength, true)
+    headerOffset += 4
+  }
+  
+  // Write root data
+  let dataOffset = headerSize
+  for (const root of serialized.roots) {
+    result.set(new Uint8Array(root), dataOffset)
+    dataOffset += root.byteLength
+  }
+  
+  return result
 }
 
 // Compile scene data into a binary buffer for efficient transmission
@@ -91,6 +126,7 @@ function compileSceneData(glbData: GLBData, cameraData: CameraData | null): { me
     const indicesLength = mesh.indices?.byteLength ?? 0
     const aoLength = mesh.bakedData?.ambientOcclusion.byteLength ?? 0
     const vertexColorsLength = mesh.bakedData?.vertexColors.byteLength ?? 0
+    const bvhLength = mesh.bvhData?.byteLength ?? 0
     
     meshOffsets.push({
       name: mesh.name,
@@ -99,6 +135,7 @@ function compileSceneData(glbData: GLBData, cameraData: CameraData | null): { me
       hasNormals: !!mesh.normals,
       hasUvs: !!mesh.uvs,
       hasBakedData: !!mesh.bakedData,
+      hasBvhData: !!mesh.bvhData,
       positionsOffset: totalBytes,
       positionsLength,
       normalsOffset: totalBytes + positionsLength,
@@ -111,9 +148,11 @@ function compileSceneData(glbData: GLBData, cameraData: CameraData | null): { me
       aoLength,
       vertexColorsOffset: totalBytes + positionsLength + normalsLength + uvsLength + indicesLength + aoLength,
       vertexColorsLength,
+      bvhOffset: totalBytes + positionsLength + normalsLength + uvsLength + indicesLength + aoLength + vertexColorsLength,
+      bvhLength,
     })
     
-    totalBytes += positionsLength + normalsLength + uvsLength + indicesLength + aoLength + vertexColorsLength
+    totalBytes += positionsLength + normalsLength + uvsLength + indicesLength + aoLength + vertexColorsLength + bvhLength
   }
   
   // Create the binary buffer
@@ -150,6 +189,12 @@ function compileSceneData(glbData: GLBData, cameraData: CameraData | null): { me
       offset += mesh.bakedData.ambientOcclusion.byteLength
       view.set(new Uint8Array(mesh.bakedData.vertexColors.buffer), offset)
       offset += mesh.bakedData.vertexColors.byteLength
+    }
+    
+    // Copy BVH data
+    if (mesh.bvhData) {
+      view.set(mesh.bvhData, offset)
+      offset += mesh.bvhData.byteLength
     }
   }
   
@@ -335,6 +380,12 @@ async function extractGLBData(file: File, shouldBake: boolean = false): Promise<
           })
         }
         
+        // Serialize BVH before disposal
+        let bvhData: Uint8Array | undefined
+        if (geometry.boundsTree) {
+          bvhData = serializeBVH(geometry.boundsTree)
+        }
+        
         const meshData: MeshData = {
           name: child.name || `mesh_${meshes.length}`,
           positions: new Float32Array(geometry.attributes.position.array),
@@ -349,7 +400,8 @@ async function extractGLBData(file: File, shouldBake: boolean = false): Promise<
                 ? new Uint16Array(geometry.index.array) 
                 : new Uint32Array(geometry.index.array))
             : null,
-          bakedData
+          bakedData,
+          bvhData,
         }
         meshes.push(meshData)
         
