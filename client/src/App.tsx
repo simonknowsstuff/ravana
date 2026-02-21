@@ -294,7 +294,7 @@ function App() {
         canvasHeight: RENDER_HEIGHT,
         camera: {
           cameraPos: savedCameraData?.position ?? { x: 0, y: 2, z: 5 },
-          viewMatrix: savedCameraData?.viewMatrix || [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1],
+          viewMatrix: savedCameraData?.cameraMatrix || [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1],
           fov: savedCameraData?.fov ?? 50,
           sunDir: { x: 0.5, y: 1.0, z: 0.5 },
         },

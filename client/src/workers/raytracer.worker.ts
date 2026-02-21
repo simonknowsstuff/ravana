@@ -351,11 +351,10 @@ self.onmessage = (event: MessageEvent<WorkerPayload | any>) => {
         pixels[pixelIdx++] = Math.min(255, Math.round(gamma(acesTonemap(totalB)) * 255));
         pixels[pixelIdx++] = 255;
       } else {
-        // Sky gradient
-        const t = 0.5 * (rd.y + 1.0);
-        pixels[pixelIdx++] = Math.round((1.0 - t) * 40 + t * 135);
-        pixels[pixelIdx++] = Math.round((1.0 - t) * 45 + t * 180);
-        pixels[pixelIdx++] = Math.round((1.0 - t) * 60 + t * 230);
+        // Dark background
+        pixels[pixelIdx++] = 18;
+        pixels[pixelIdx++] = 18;
+        pixels[pixelIdx++] = 20;
         pixels[pixelIdx++] = 255;
       }
     }

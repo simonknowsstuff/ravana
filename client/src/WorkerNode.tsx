@@ -166,7 +166,7 @@ export default function WorkerNode() {
   }, []);
 
   return (
-    <div className="min-h-screen bg-slate-900 flex flex-col items-center justify-center p-6 text-center font-sans">
+    <div className="min-h-screen bg-black flex flex-col items-center justify-center p-6 text-center font-sans">
       <div className={`w-24 h-24 mb-8 rounded-full border-4 border-t-transparent animate-spin ${isConnected ? 'border-cyan-500' : 'border-slate-600'}`}></div>
       
       <h1 className="text-4xl font-bold text-white mb-3 tracking-tight">Shard Node</h1>
