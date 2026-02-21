@@ -28,12 +28,15 @@ interface WorkerPayload {
   startX: number; startY: number; width: number; height: number;
   canvasWidth: number; canvasHeight: number;
   fov?: number;
+  exposure?: number;  // EV compensation (-10 to +10)
+  lightScale?: number;  // Light intensity multiplier
   cameraPos?: Vector3; viewMatrix?: number[]; sunDir?: Vector3;
-  camera?: { cameraPos?: Vector3; viewMatrix?: number[]; fov?: number; sunDir?: Vector3; };
+  camera?: { cameraPos?: Vector3; viewMatrix?: number[]; fov?: number; sunDir?: Vector3; exposure?: number; lightScale?: number; };
 }
 
 const BVH_NODE_SIZE = 10;
 const SHADOW_EPSILON = 0.005;  // offset to avoid self-intersection
+const SHADOW_RAY_MIN = 0.0001; // minimum t for shadow ray hits (much smaller since origin is already offset)
 
 self.onmessage = (event: MessageEvent<WorkerPayload | any>) => {
   let positions: Float32Array, bvhBuffer: Float32Array, indices: Uint32Array;
@@ -44,13 +47,15 @@ self.onmessage = (event: MessageEvent<WorkerPayload | any>) => {
   let lights: LightDef[] = [];
   let startX:number, startY:number, width:number, height:number, canvasWidth:number, canvasHeight:number;
   let fov: number | undefined;
+  let exposure: number | undefined;
+  let lightScale: number | undefined;
   let cameraPos: Vector3 | undefined, viewMatrix: number[] | undefined, sunDir: Vector3 | undefined;
 
   if (event.data.camera) {
     ({ positions, bvhBuffer, indices, colors, normals, emissive, ao, lights, startX, startY, width, height, canvasWidth, canvasHeight } = event.data);
-    ({ cameraPos, viewMatrix, fov, sunDir } = event.data.camera);
+    ({ cameraPos, viewMatrix, fov, sunDir, exposure, lightScale } = event.data.camera);
   } else {
-    ({ positions, bvhBuffer, indices, colors, normals, emissive, ao, lights, startX, startY, width, height, canvasWidth, canvasHeight, fov, cameraPos, viewMatrix, sunDir } = event.data);
+    ({ positions, bvhBuffer, indices, colors, normals, emissive, ao, lights, startX, startY, width, height, canvasWidth, canvasHeight, fov, cameraPos, viewMatrix, sunDir, exposure, lightScale } = event.data);
   }
   lights = lights || [];
 
@@ -60,6 +65,8 @@ self.onmessage = (event: MessageEvent<WorkerPayload | any>) => {
   sunDir = normalize(sunDir);
 
   if (!fov || fov <= 0) fov = 50;
+  if (exposure === undefined) exposure = 0;
+  if (lightScale === undefined) lightScale = 1.0;
   console.log(`[Worker] chunk [${startX},${startY}] ${width}x${height} | ${indices.length/3} tris, ${lights.length} lights, fov=${fov}`);
 
   if (bvhBuffer.length < 10) { console.error("[Worker] FATAL: empty BVH"); return; }
@@ -87,7 +94,7 @@ self.onmessage = (event: MessageEvent<WorkerPayload | any>) => {
             { x: positions[bIdx], y: positions[bIdx+1], z: positions[bIdx+2] },
             { x: positions[cIdx], y: positions[cIdx+1], z: positions[cIdx+2] }
           );
-          if (t !== null && t > SHADOW_EPSILON && t < maxDist) return true;
+          if (t !== null && t > SHADOW_RAY_MIN && t < maxDist) return true;
         }
       } else {
         stack[stackPtr++] = nodeIdx + 1;
@@ -236,7 +243,11 @@ self.onmessage = (event: MessageEvent<WorkerPayload | any>) => {
               attenuation = 0;
             } else {
               const decay = light.decay > 0 ? light.decay : 2;
-              attenuation = light.intensity / Math.max(1, Math.pow(lightDist, decay));
+              // Blender's physically-based point light formula: intensity / (4π * distance²)
+              // GLTF KHR_lights_punctual: luminous intensity (cd) spreads over 4π steradians
+              // Apply user-configurable lightScale to match Blender's exact output
+              const distSq = Math.max(0.0001, Math.pow(lightDist, decay));
+              attenuation = (light.intensity * lightScale!) / (4.0 * 3.14159265359 * distSq);
             }
 
             if (light.type === 'spot' && light.angle > 0) {
@@ -335,7 +346,13 @@ self.onmessage = (event: MessageEvent<WorkerPayload | any>) => {
           }
         }
 
-        // ─── ACES Tone Mapping + Gamma ───
+        // ─── Exposure + ACES Tone Mapping + Gamma ───
+        // Apply exposure compensation (EV): multiply by 2^exposure
+        const exposureFactor = Math.pow(2, exposure!);
+        totalR *= exposureFactor;
+        totalG *= exposureFactor;
+        totalB *= exposureFactor;
+
         const acesTonemap = (v: number) => {
           const a = 2.51;
           const b = 0.03;

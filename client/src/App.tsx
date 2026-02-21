@@ -169,6 +169,8 @@ function App() {
   const [currentFile, setCurrentFile] = useState<File | null>(null)
   const [savedCameraData, setSavedCameraData] = useState<CameraData | null>(null)
   const [showViewer, setShowViewer] = useState(true)
+  const [exposure, setExposure] = useState<number>(0)  // EV compensation: -10 to +10
+  const [lightScale, setLightScale] = useState<number>(1.0)  // Light intensity multiplier
   
   // File input ref (to reset after clearing)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -297,6 +299,8 @@ function App() {
           viewMatrix: savedCameraData?.cameraMatrix || [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1],
           fov: savedCameraData?.fov ?? 50,
           sunDir: { x: 0.5, y: 1.0, z: 0.5 },
+          exposure: exposure,  // EV compensation
+          lightScale: lightScale,  // Light intensity multiplier
         },
         lights: glbData.lights,
         sunDir: { x: 0.5, y: 1.0, z: 0.5 }
@@ -500,20 +504,66 @@ function App() {
 
           {/* 3D Viewer Toggle */}
           {fileName && (
-            <div className="mt-4 flex items-center space-x-3 bg-slate-800/50 rounded-lg p-4">
-              <label className="flex items-center space-x-3 cursor-pointer">
+            <>
+              <div className="mt-4 flex items-center space-x-3 bg-slate-800/50 rounded-lg p-4">
+                <label className="flex items-center space-x-3 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={showViewer}
+                    onChange={(e) => setShowViewer(e.target.checked)}
+                    className="w-5 h-5 rounded border-slate-600 bg-slate-700 text-purple-500 focus:ring-purple-500 focus:ring-offset-slate-900"
+                  />
+                  <div>
+                    <span className="text-white font-medium">Show 3D Viewer</span>
+                    <p className="text-slate-400 text-sm">Low quality preview with camera detection</p>
+                  </div>
+                </label>
+              </div>
+
+              {/* Exposure Control */}
+              <div className="mt-4 bg-slate-800/50 rounded-lg p-4">
+                <label className="block text-white font-medium mb-2">
+                  Exposure: {exposure > 0 ? '+' : ''}{exposure.toFixed(1)} EV
+                </label>
                 <input
-                  type="checkbox"
-                  checked={showViewer}
-                  onChange={(e) => setShowViewer(e.target.checked)}
-                  className="w-5 h-5 rounded border-slate-600 bg-slate-700 text-purple-500 focus:ring-purple-500 focus:ring-offset-slate-900"
+                  type="range"
+                  min="-10"
+                  max="10"
+                  step="0.1"
+                  value={exposure}
+                  onChange={(e) => setExposure(parseFloat(e.target.value))}
+                  className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-purple-500"
                 />
-                <div>
-                  <span className="text-white font-medium">Show 3D Viewer</span>
-                  <p className="text-slate-400 text-sm">Low quality preview with camera detection</p>
+                <div className="flex justify-between text-xs text-slate-500 mt-1">
+                  <span>-10 EV (darker)</span>
+                  <span>0</span>
+                  <span>+10 EV (brighter)</span>
                 </div>
-              </label>
-            </div>
+                <p className="text-slate-400 text-sm mt-2">Adjust overall brightness (matches Blender's exposure setting)</p>
+              </div>
+
+              {/* Light Intensity Scale */}
+              <div className="mt-4 bg-slate-800/50 rounded-lg p-4">
+                <label className="block text-white font-medium mb-2">
+                  Light Intensity Scale: {lightScale.toFixed(2)}x
+                </label>
+                <input
+                  type="range"
+                  min="0.01"
+                  max="10"
+                  step="0.01"
+                  value={lightScale}
+                  onChange={(e) => setLightScale(parseFloat(e.target.value))}
+                  className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
+                />
+                <div className="flex justify-between text-xs text-slate-500 mt-1">
+                  <span>0.01x (dimmer lights)</span>
+                  <span>1x</span>
+                  <span>10x (brighter lights)</span>
+                </div>
+                <p className="text-slate-400 text-sm mt-2">Fine-tune light power to match Blender exactly (try 0.1x - 0.5x if too bright)</p>
+              </div>
+            </>
           )}
         </div>
 

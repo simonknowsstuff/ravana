@@ -231,10 +231,7 @@ function SceneContent({ file, onCameraFound, onCameraSave, savedCameraRef, camer
 
   return (
     <>
-      {/* Standard lighting setup */}
-      <ambientLight intensity={0.5} />
-      <directionalLight position={[10, 10, 5]} intensity={1} />
-      <directionalLight position={[-10, -10, -5]} intensity={0.5} />
+      {/* No default lighting - only use lights from GLTF file */}
       
       <OrbitControls
         ref={controlsRef}
