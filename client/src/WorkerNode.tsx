@@ -1,5 +1,6 @@
 import { useEffect, useState, useRef } from 'react';
 import { io, Socket } from 'socket.io-client';
+import RaytracerWorker from './workers/raytracer.worker.ts?worker'
 
 interface GeometryCache {
   positions: Float32Array;
@@ -21,13 +22,14 @@ export default function WorkerNode() {
   const pendingTaskRef = useRef<any>(null);
 
   useEffect(() => {
-    workerRef.current = new Worker(new URL('./raytracer.worker.ts', import.meta.url), { 
+    workerRef.current = new RaytracerWorker(), { 
       type: 'module' 
-    });
+    };
 
     const serverUrl = import.meta.env.VITE_WS_SERVER_URL || `http://${window.location.hostname}:3000`;
-    const socket = io(serverUrl,{
-        transports:['websocket']
+    const socket = io(serverUrl, {
+      transports: ['websocket'], // Force websocket
+      upgrade: false             // Disable polling fallback entirely
     });
     socketRef.current = socket;
 
@@ -56,7 +58,7 @@ export default function WorkerNode() {
         if (!meshMeta) throw new Error("Metadata missing meshes array");
 
         const positionsBuffer = rawBuffer.slice(meshMeta.positionsOffset, meshMeta.positionsOffset + meshMeta.positionsLength);
-        const bvhBufferSliced = rawBuffer.slice(meshMeta.bvhOffset, meshMeta.bvhOffset + meshMeta.bvhLength);
+        const bvhBufferSliced = rawBuffer.slice(meshMeta.bvhOffset+8, meshMeta.bvhOffset + meshMeta.bvhLength);
         
         let indicesBuffer = new ArrayBuffer(0);
         if (meshMeta.indicesLength > 0) {
@@ -74,12 +76,18 @@ export default function WorkerNode() {
         // RACE CONDITION RESOLVER: Did a task arrive while we were unpacking?
         if (pendingTaskRef.current) {
           setStatus(`Crunching queued tile [${pendingTaskRef.current.startX}, ${pendingTaskRef.current.startY}]...`);
-          workerRef.current?.postMessage({
-            ...pendingTaskRef.current,
+          // flatten camera here as well
+      const queued = pendingTaskRef.current;
+      const msg = {
+            ...queued,
             positions: geoCacheRef.current.positions,
             bvhBuffer: geoCacheRef.current.bvhBuffer,
-            indices: geoCacheRef.current.indices
-          });
+            indices: geoCacheRef.current.indices,
+            cameraPos: queued.camera?.cameraPos,
+            viewMatrix: queued.camera?.viewMatrix,
+            sunDir: queued.camera?.sunDir,
+      };
+      workerRef.current?.postMessage(msg);
           pendingTaskRef.current = null; // Clear the waiting room
         }
 
@@ -102,12 +110,17 @@ export default function WorkerNode() {
 
       setStatus(`Crunching tile [${task.startX}, ${task.startY}]...`);
 
-      workerRef.current?.postMessage({
+      // flatten camera object so worker has direct access
+      const msg = {
         ...task,
         positions: geoCacheRef.current.positions,
         bvhBuffer: geoCacheRef.current.bvhBuffer,
-        indices: geoCacheRef.current.indices
-      });
+        indices: geoCacheRef.current.indices,
+        cameraPos: task.camera?.cameraPos,
+        viewMatrix: task.camera?.viewMatrix,
+        sunDir: task.camera?.sunDir,
+      };
+      workerRef.current?.postMessage(msg);
     });
 
     // 5. RECEIVE COMPLETED PIXELS FROM THE WORKER
