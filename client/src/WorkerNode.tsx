@@ -101,8 +101,6 @@ export default function WorkerNode() {
             viewMatrix: queued.camera?.viewMatrix,
             fov: queued.camera?.fov,
             sunDir: queued.camera?.sunDir,
-            exposure: queued.camera?.exposure ?? 0,
-            lightScale: queued.camera?.lightScale ?? 1.0,
           };
           workerRef.current?.postMessage(msg);
           pendingTaskRef.current = null;
@@ -141,8 +139,6 @@ export default function WorkerNode() {
         viewMatrix: task.camera?.viewMatrix,
         fov: task.camera?.fov,
         sunDir: task.camera?.sunDir,
-        exposure: task.camera?.exposure ?? 0,
-        lightScale: task.camera?.lightScale ?? 1.0,
       };
       workerRef.current?.postMessage(msg);
     });
