@@ -6,6 +6,9 @@ interface GeometryCache {
   positions: Float32Array;
   indices: Uint32Array;
   bvhBuffer: Float32Array;
+  colors: Float32Array;
+  normals: Float32Array;
+  emissive: Float32Array;
 }
 
 export default function WorkerNode() {
@@ -44,51 +47,58 @@ export default function WorkerNode() {
       setStatus('Lost connection to Swarm.');
     });
 
-    // 3. THE UNPACKER
+    // 3. THE UNPACKER — read pre-merged scene geometry from the binary buffer
     socket.on('sync_geometry', (payload) => {
       try {
         setStatus('Unpacking Geometry...');
         const { metadata, buffer } = payload;
         
-        // Safety check: Is the buffer actually an ArrayBuffer?
-        // Socket.io sometimes wraps binary in a Buffer object on the wire
+        // Safety check: Socket.io sometimes wraps binary in a Buffer object
         const rawBuffer = buffer instanceof ArrayBuffer ? buffer : new Uint8Array(buffer).buffer;
         
-        const meshMeta = metadata.geometry.meshes[0];
-        if (!meshMeta) throw new Error("Metadata missing meshes array");
+        const m = metadata.geometry.merged;
+        if (!m) throw new Error("Metadata missing merged scene data");
 
-        const positionsBuffer = rawBuffer.slice(meshMeta.positionsOffset, meshMeta.positionsOffset + meshMeta.positionsLength);
-        const bvhBufferSliced = rawBuffer.slice(meshMeta.bvhOffset+8, meshMeta.bvhOffset + meshMeta.bvhLength);
-        
-        let indicesBuffer = new ArrayBuffer(0);
-        if (meshMeta.indicesLength > 0) {
-          indicesBuffer = rawBuffer.slice(meshMeta.indicesOffset, meshMeta.indicesOffset + meshMeta.indicesLength);
-        }
+        const positions = new Float32Array(rawBuffer.slice(m.positionsOffset, m.positionsOffset + m.positionsLength));
+        const indices = new Uint32Array(rawBuffer.slice(m.indicesOffset, m.indicesOffset + m.indicesLength));
+        const bvhBuffer = new Float32Array(rawBuffer.slice(m.bvhOffset, m.bvhOffset + m.bvhLength));
+        const colors = m.colorsLength > 0
+          ? new Float32Array(rawBuffer.slice(m.colorsOffset, m.colorsOffset + m.colorsLength))
+          : new Float32Array(0);
+        const normals = m.normalsLength > 0
+          ? new Float32Array(rawBuffer.slice(m.normalsOffset, m.normalsOffset + m.normalsLength))
+          : new Float32Array(0);
+        const emissive = m.emissiveLength > 0
+          ? new Float32Array(rawBuffer.slice(m.emissiveOffset, m.emissiveOffset + m.emissiveLength))
+          : new Float32Array(0);
 
-        geoCacheRef.current = {
-          positions: new Float32Array(positionsBuffer),
-          bvhBuffer: new Float32Array(bvhBufferSliced),
-          indices: new Uint32Array(indicesBuffer)
-        };
+        geoCacheRef.current = { positions, indices, bvhBuffer, colors, normals, emissive };
         
-        setStatus('Geometry Cached.');
+        const vertCount = positions.length / 3;
+        const triCount = indices.length / 3;
+        const nodeCount = bvhBuffer.length / 10;
+        setStatus(`Geometry Cached. (${vertCount} verts, ${triCount} tris, ${nodeCount} BVH nodes)`);
+        console.log(`[worker] unpacked merged scene: ${vertCount} verts, ${triCount} tris, ${nodeCount} BVH nodes`);
         
         // RACE CONDITION RESOLVER: Did a task arrive while we were unpacking?
         if (pendingTaskRef.current) {
           setStatus(`Crunching queued tile [${pendingTaskRef.current.startX}, ${pendingTaskRef.current.startY}]...`);
-          // flatten camera here as well
-      const queued = pendingTaskRef.current;
-      const msg = {
+          const queued = pendingTaskRef.current;
+          const msg = {
             ...queued,
             positions: geoCacheRef.current.positions,
             bvhBuffer: geoCacheRef.current.bvhBuffer,
             indices: geoCacheRef.current.indices,
+            colors: geoCacheRef.current.colors,
+            normals: geoCacheRef.current.normals,
+            emissive: geoCacheRef.current.emissive,
             cameraPos: queued.camera?.cameraPos,
             viewMatrix: queued.camera?.viewMatrix,
+            fov: queued.camera?.fov,
             sunDir: queued.camera?.sunDir,
-      };
-      workerRef.current?.postMessage(msg);
-          pendingTaskRef.current = null; // Clear the waiting room
+          };
+          workerRef.current?.postMessage(msg);
+          pendingTaskRef.current = null;
         }
 
       } catch (err: any) {
@@ -116,8 +126,12 @@ export default function WorkerNode() {
         positions: geoCacheRef.current.positions,
         bvhBuffer: geoCacheRef.current.bvhBuffer,
         indices: geoCacheRef.current.indices,
+        colors: geoCacheRef.current.colors,
+        normals: geoCacheRef.current.normals,
+        emissive: geoCacheRef.current.emissive,
         cameraPos: task.camera?.cameraPos,
         viewMatrix: task.camera?.viewMatrix,
+        fov: task.camera?.fov,
         sunDir: task.camera?.sunDir,
       };
       workerRef.current?.postMessage(msg);

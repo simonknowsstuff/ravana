@@ -6,7 +6,7 @@ import { ScenePayload } from './types'
 
 // Compile scene data into a binary buffer for efficient transmission
 function compileSceneData(glbData: GLBData, cameraData: CameraData | null): { metadata: ScenePayload; buffer: ArrayBuffer } {
-  // Calculate total buffer size needed
+  // Calculate total buffer size needed for per-mesh data
   let totalBytes = 0
   const meshOffsets: ScenePayload['geometry']['meshes'] = []
   
@@ -46,6 +46,30 @@ function compileSceneData(glbData: GLBData, cameraData: CameraData | null): { me
     totalBytes += positionsLength + normalsLength + uvsLength + indicesLength + aoLength + vertexColorsLength + bvhLength
   }
   
+  // Merged scene data offsets (appended after per-mesh data)
+  const merged = glbData.merged
+  const mergedPosOff = totalBytes
+  const mergedIdxOff = mergedPosOff + merged.positions.byteLength
+  const mergedBvhOff = mergedIdxOff + merged.indices.byteLength
+  const mergedColOff = mergedBvhOff + merged.bvhData.byteLength
+  const mergedNrmOff = mergedColOff + merged.colors.byteLength
+  const mergedEmiOff = mergedNrmOff + merged.normals.byteLength
+  const mergedMeta = {
+    positionsOffset: mergedPosOff,
+    positionsLength: merged.positions.byteLength,
+    indicesOffset: mergedIdxOff,
+    indicesLength: merged.indices.byteLength,
+    bvhOffset: mergedBvhOff,
+    bvhLength: merged.bvhData.byteLength,
+    colorsOffset: mergedColOff,
+    colorsLength: merged.colors.byteLength,
+    normalsOffset: mergedNrmOff,
+    normalsLength: merged.normals.byteLength,
+    emissiveOffset: mergedEmiOff,
+    emissiveLength: merged.emissive.byteLength,
+  }
+  totalBytes += merged.positions.byteLength + merged.indices.byteLength + merged.bvhData.byteLength + merged.colors.byteLength + merged.normals.byteLength + merged.emissive.byteLength
+  
   // Create the binary buffer
   const buffer = new ArrayBuffer(totalBytes)
   const view = new Uint8Array(buffer)
@@ -53,41 +77,57 @@ function compileSceneData(glbData: GLBData, cameraData: CameraData | null): { me
   let offset = 0
   for (const mesh of glbData.meshes) {
     // Copy positions
-    view.set(new Uint8Array(mesh.positions.buffer), offset)
+    view.set(new Uint8Array(mesh.positions.buffer, mesh.positions.byteOffset, mesh.positions.byteLength), offset)
     offset += mesh.positions.byteLength
     
     // Copy normals
     if (mesh.normals) {
-      view.set(new Uint8Array(mesh.normals.buffer), offset)
+      view.set(new Uint8Array(mesh.normals.buffer, mesh.normals.byteOffset, mesh.normals.byteLength), offset)
       offset += mesh.normals.byteLength
     }
     
     // Copy UVs
     if (mesh.uvs) {
-      view.set(new Uint8Array(mesh.uvs.buffer), offset)
+      view.set(new Uint8Array(mesh.uvs.buffer, mesh.uvs.byteOffset, mesh.uvs.byteLength), offset)
       offset += mesh.uvs.byteLength
     }
     
     // Copy indices
     if (mesh.indices) {
-      view.set(new Uint8Array(mesh.indices.buffer), offset)
+      view.set(new Uint8Array(mesh.indices.buffer, mesh.indices.byteOffset, mesh.indices.byteLength), offset)
       offset += mesh.indices.byteLength
     }
     
     // Copy baked data
     if (mesh.bakedData) {
-      view.set(new Uint8Array(mesh.bakedData.ambientOcclusion.buffer), offset)
-      offset += mesh.bakedData.ambientOcclusion.byteLength
-      view.set(new Uint8Array(mesh.bakedData.vertexColors.buffer), offset)
-      offset += mesh.bakedData.vertexColors.byteLength
+      const ao = mesh.bakedData.ambientOcclusion
+      view.set(new Uint8Array(ao.buffer, ao.byteOffset, ao.byteLength), offset)
+      offset += ao.byteLength
+      const vc = mesh.bakedData.vertexColors
+      view.set(new Uint8Array(vc.buffer, vc.byteOffset, vc.byteLength), offset)
+      offset += vc.byteLength
     }
     
     // Copy BVH data
     if (mesh.bvhData) {
-      view.set(mesh.bvhData, offset)
+      view.set(new Uint8Array(mesh.bvhData.buffer, mesh.bvhData.byteOffset, mesh.bvhData.byteLength), offset)
       offset += mesh.bvhData.byteLength
     }
   }
+  
+  // Copy merged scene data
+  view.set(new Uint8Array(merged.positions.buffer, merged.positions.byteOffset, merged.positions.byteLength), offset)
+  offset += merged.positions.byteLength
+  view.set(new Uint8Array(merged.indices.buffer, merged.indices.byteOffset, merged.indices.byteLength), offset)
+  offset += merged.indices.byteLength
+  view.set(new Uint8Array(merged.bvhData.buffer, merged.bvhData.byteOffset, merged.bvhData.byteLength), offset)
+  offset += merged.bvhData.byteLength
+  view.set(new Uint8Array(merged.colors.buffer, merged.colors.byteOffset, merged.colors.byteLength), offset)
+  offset += merged.colors.byteLength
+  view.set(new Uint8Array(merged.normals.buffer, merged.normals.byteOffset, merged.normals.byteLength), offset)
+  offset += merged.normals.byteLength
+  view.set(new Uint8Array(merged.emissive.buffer, merged.emissive.byteOffset, merged.emissive.byteLength), offset)
+  offset += merged.emissive.byteLength
   
   const metadata: ScenePayload = {
     timestamp: Date.now(),
@@ -107,7 +147,9 @@ function compileSceneData(glbData: GLBData, cameraData: CameraData | null): { me
       totalVertices: glbData.meshes.reduce((sum, m) => sum + m.positions.length / 3, 0),
       totalIndices: glbData.meshes.reduce((sum, m) => sum + (m.indices?.length ?? 0), 0),
       meshes: meshOffsets,
+      merged: mergedMeta,
     },
+    lights: glbData.lights,
   }
   
   return { metadata, buffer }
@@ -132,6 +174,26 @@ function App() {
   const [isSending, setIsSending] = useState(false)
   const [lastSentPayload, setLastSentPayload] = useState<ScenePayload | null>(null)
 
+  // Render canvas state
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  const [isRendering, setIsRendering] = useState(false)
+  const [tilesReceived, setTilesReceived] = useState(0)
+  const [totalTiles, setTotalTiles] = useState(0)
+  const [renderStartTime, setRenderStartTime] = useState<number | null>(null)
+  const [renderElapsed, setRenderElapsed] = useState<string>('')
+  // Derive render resolution from camera aspect ratio (projection matrix)
+  const baseHeight = 600
+  const cameraAspect = (() => {
+    if (savedCameraData?.projectionMatrix) {
+      const p = savedCameraData.projectionMatrix
+      // proj[5] = 1/tan(fov/2), proj[0] = 1/(aspect*tan(fov/2)) → aspect = p[5]/p[0]
+      if (p[0] !== 0) return p[5] / p[0]
+    }
+    return 16 / 9
+  })()
+  const RENDER_WIDTH = Math.round(baseHeight * cameraAspect)
+  const RENDER_HEIGHT = baseHeight
+
   // Initialize WebSocket connection
   useEffect(() => {
     const serverUrl = import.meta.env.VITE_WS_SERVER_URL || `http://${window.location.hostname}:3000`;
@@ -149,6 +211,38 @@ function App() {
     socket.on('disconnect', () => {
       console.log('[socket] disconnected')
       setIsConnected(false)
+    })
+
+    // Listen for completed tiles from workers
+    socket.on('render_update', (payload: { buffer: ArrayBuffer | Uint8Array; startX: number; startY: number; width: number; height: number }) => {
+      const canvas = canvasRef.current
+      if (!canvas) return
+      const ctx = canvas.getContext('2d')
+      if (!ctx) return
+
+      try {
+        const { startX, startY, width, height } = payload
+        // Ensure we have a proper ArrayBuffer
+        const raw = payload.buffer instanceof ArrayBuffer
+          ? payload.buffer
+          : new Uint8Array(payload.buffer).buffer
+        const pixels = new Uint8ClampedArray(raw)
+
+        // Validate buffer size matches tile dimensions
+        const expected = width * height * 4
+        if (pixels.length !== expected) {
+          console.error(`[render] Buffer size mismatch: got ${pixels.length}, expected ${expected} for ${width}x${height} tile`)
+          return
+        }
+
+        const imageData = new ImageData(pixels, width, height)
+        ctx.putImageData(imageData, startX, startY)
+
+        setTilesReceived(prev => prev + 1)
+        console.log(`[render] painted tile at [${startX}, ${startY}] (${width}x${height})`)
+      } catch (err) {
+        console.error('[render] Failed to paint tile:', err)
+      }
     })
 
     return () => {
@@ -172,12 +266,34 @@ function App() {
       })
 
       // 2. THE SPARK: Tell the server to create the queue and start the Swarm
+      const tileSize = 64
+      const cols = Math.ceil(RENDER_WIDTH / tileSize)
+      const rows = Math.ceil(RENDER_HEIGHT / tileSize)
+      setTotalTiles(cols * rows)
+      setTilesReceived(0)
+      setIsRendering(true)
+      setRenderStartTime(Date.now())
+
+      // Initialize canvas to black
+      const canvas = canvasRef.current
+      if (canvas) {
+        const ctx = canvas.getContext('2d')
+        if (ctx) {
+          ctx.fillStyle = '#0f0f19'
+          ctx.fillRect(0, 0, RENDER_WIDTH, RENDER_HEIGHT)
+        }
+      }
+
       socketRef.current.emit('start_render', {
-        canvasWidth: 800,
-        canvasHeight: 450,
-        // Make sure your savedCameraData has these!
-        cameraPos: savedCameraData?.position,
-        viewMatrix: savedCameraData?.viewMatrix || [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1], 
+        canvasWidth: RENDER_WIDTH,
+        canvasHeight: RENDER_HEIGHT,
+        camera: {
+          cameraPos: savedCameraData?.position ?? { x: 0, y: 2, z: 5 },
+          viewMatrix: savedCameraData?.viewMatrix || [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1],
+          fov: savedCameraData?.fov ?? 50,
+          sunDir: { x: 0.5, y: 1.0, z: 0.5 },
+        },
+        lights: glbData.lights,
         sunDir: { x: 0.5, y: 1.0, z: 0.5 }
       })
       
@@ -444,6 +560,47 @@ function App() {
                   Near: {savedCameraData.near.toFixed(2)}<br/>
                   Far: {savedCameraData.far.toFixed(1)}
                 </span>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Render Canvas */}
+        {(isRendering || tilesReceived > 0) && (
+          <div className="mb-8">
+            <div className="bg-slate-800 rounded-xl overflow-hidden">
+              <div className="flex items-center justify-between px-6 py-4 border-b border-slate-700">
+                <h2 className="text-xl font-semibold text-white flex items-center">
+                  <svg className="w-5 h-5 mr-2 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                  </svg>
+                  Distributed Render
+                </h2>
+                <div className="flex items-center space-x-4 text-sm">
+                  <span className="text-slate-400">
+                    {tilesReceived} / {totalTiles} tiles
+                  </span>
+                  {totalTiles > 0 && (
+                    <div className="w-32 h-2 bg-slate-700 rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-gradient-to-r from-cyan-500 to-purple-500 transition-all duration-300"
+                        style={{ width: `${Math.min(100, (tilesReceived / totalTiles) * 100)}%` }}
+                      />
+                    </div>
+                  )}
+                  {tilesReceived === totalTiles && totalTiles > 0 && (
+                    <span className="text-green-400 font-medium">Complete</span>
+                  )}
+                </div>
+              </div>
+              <div className="flex justify-center p-4 bg-slate-900/50">
+                <canvas
+                  ref={canvasRef}
+                  width={RENDER_WIDTH}
+                  height={RENDER_HEIGHT}
+                  className="rounded-lg border border-slate-700 shadow-lg shadow-cyan-500/10"
+                  style={{ maxWidth: '100%', height: 'auto', imageRendering: 'pixelated' }}
+                />
               </div>
             </div>
           </div>

@@ -43,5 +43,32 @@ export interface ScenePayload {
       bvhOffset: number
       bvhLength: number
     }>
+    /** Pre-merged scene geometry with a single BVH — byte offsets in the binary buffer */
+    merged: {
+      positionsOffset: number
+      positionsLength: number
+      indicesOffset: number
+      indicesLength: number
+      bvhOffset: number
+      bvhLength: number
+      colorsOffset: number
+      colorsLength: number
+      normalsOffset: number
+      normalsLength: number
+      emissiveOffset: number
+      emissiveLength: number
+    }
   }
+  /** Lights extracted from the GLB scene */
+  lights: Array<{
+    type: 'point' | 'directional' | 'spot'
+    position: { x: number; y: number; z: number }
+    direction: { x: number; y: number; z: number }
+    color: { r: number; g: number; b: number }
+    intensity: number
+    distance: number
+    decay: number
+    angle: number
+    penumbra: number
+  }>
 }

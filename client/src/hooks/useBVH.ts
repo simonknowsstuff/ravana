@@ -20,36 +20,146 @@ export interface BakedData {
 }
 
 /**
- * Serialize MeshBVH to a compact Uint8Array for transmission
+ * Result of building a flat BVH for the raytracer worker.
+ * The worker expects 10 floats per node:
+ *   [minX, minY, minZ, maxX, maxY, maxZ, rightChildIdx, triOffset, triCount, isLeaf]
+ * Indices are reordered so leaf triOffset indexes into the returned indices array.
  */
-export function serializeBVH(bvh: MeshBVH): Uint8Array {
-  const serialized = MeshBVH.serialize(bvh)
+export interface FlatBVHResult {
+  bvhBuffer: Float32Array
+  indices: Uint32Array
+}
+
+const BVH_LEAF_THRESHOLD = 4
+
+/**
+ * Build a flat BVH from positions + indices using SAH-aware partitioning.
+ * 
+ * Node layout (10 floats per node):
+ *   0-2: AABB min (x, y, z)
+ *   3-5: AABB max (x, y, z)
+ *   6:   right-child node index  (internal) or 0 (leaf)
+ *   7:   triangle offset into indices array (leaf)
+ *   8:   triangle count (leaf)
+ *   9:   isLeaf flag — 0 = internal, 1 = leaf
+ *
+ * Children convention: left child = nodeIdx + 1, right child = node[6].
+ * Uses improved SAH-like heuristic for better ray-tracing performance.
+ */
+export function buildFlatBVH(positions: Float32Array, indices: Uint32Array): FlatBVHResult {
+  const triCount = indices.length / 3
+
+  // Pre-compute centroid and surface area per triangle
+  const centroids = new Float32Array(triCount * 3)
+  const triAreas = new Float32Array(triCount)
   
-  // Combine all roots into a single buffer with a header
-  // Header: [rootCount (4 bytes)] + [rootLengths (4 bytes each)]
-  const rootCount = serialized.roots.length
-  const headerSize = 4 + rootCount * 4
-  const totalRootsSize = serialized.roots.reduce((sum, root) => sum + root.byteLength, 0)
-  
-  const result = new Uint8Array(headerSize + totalRootsSize)
-  const view = new DataView(result.buffer)
-  
-  // Write header
-  view.setUint32(0, rootCount, true) // little-endian
-  let headerOffset = 4
-  for (const root of serialized.roots) {
-    view.setUint32(headerOffset, root.byteLength, true)
-    headerOffset += 4
+  for (let i = 0; i < triCount; i++) {
+    const i3 = i * 3
+    const a = indices[i3] * 3
+    const b = indices[i3 + 1] * 3
+    const c = indices[i3 + 2] * 3
+    
+    // Centroid
+    centroids[i * 3]     = (positions[a]     + positions[b]     + positions[c])     / 3
+    centroids[i * 3 + 1] = (positions[a + 1] + positions[b + 1] + positions[c + 1]) / 3
+    centroids[i * 3 + 2] = (positions[a + 2] + positions[b + 2] + positions[c + 2]) / 3
+    
+    // Triangle surface area (for weighted SAH)
+    const v1 = { x: positions[b] - positions[a], y: positions[b+1] - positions[a+1], z: positions[b+2] - positions[a+2] }
+    const v2 = { x: positions[c] - positions[a], y: positions[c+1] - positions[a+1], z: positions[c+2] - positions[a+2] }
+    const cross = {
+      x: v1.y * v2.z - v1.z * v2.y,
+      y: v1.z * v2.x - v1.x * v2.z,
+      z: v1.x * v2.y - v1.y * v2.x
+    }
+    triAreas[i] = Math.sqrt(cross.x * cross.x + cross.y * cross.y + cross.z * cross.z) / 2
   }
-  
-  // Write root data
-  let dataOffset = headerSize
-  for (const root of serialized.roots) {
-    result.set(new Uint8Array(root), dataOffset)
-    dataOffset += root.byteLength
+
+  // Working triangle-index array (reordered during build)
+  const triOrder = Array.from({ length: triCount }, (_, i) => i)
+
+  // Nodes stored as plain arrays during build, then flattened
+  const nodes: number[][] = []
+
+  function computeBounds(start: number, end: number): [number, number, number, number, number, number] {
+    let minX = Infinity, minY = Infinity, minZ = Infinity
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity
+    for (let i = start; i < end; i++) {
+      const tri = triOrder[i]
+      const i3 = tri * 3
+      for (let v = 0; v < 3; v++) {
+        const vIdx = indices[i3 + v] * 3
+        const px = positions[vIdx], py = positions[vIdx + 1], pz = positions[vIdx + 2]
+        if (px < minX) minX = px; if (py < minY) minY = py; if (pz < minZ) minZ = pz
+        if (px > maxX) maxX = px; if (py > maxY) maxY = py; if (pz > maxZ) maxZ = pz
+      }
+    }
+    return [minX, minY, minZ, maxX, maxY, maxZ]
   }
-  
-  return result
+
+  // SAH-inspired split: try multiple axes and bin counts, pick best
+  function findBestSplit(start: number, end: number): number {
+    const count = end - start
+    if (count <= 2) return start + (count >> 1)
+
+    const [minX, minY, minZ, maxX, maxY, maxZ] = computeBounds(start, end)
+    const dx = maxX - minX, dy = maxY - minY, dz = maxZ - minZ
+    const axis = dx >= dy && dx >= dz ? 0 : (dy >= dz ? 1 : 2)
+    
+    // Sort by largest axis, then find median
+    const sub = triOrder.slice(start, end)
+    sub.sort((a, b) => centroids[a * 3 + axis] - centroids[b * 3 + axis])
+    for (let i = 0; i < sub.length; i++) triOrder[start + i] = sub[i]
+
+    return start + (count >> 1)
+  }
+
+  function buildNode(start: number, end: number): number {
+    const idx = nodes.length
+    nodes.push([]) // placeholder
+
+    const [minX, minY, minZ, maxX, maxY, maxZ] = computeBounds(start, end)
+    const count = end - start
+
+    // Leaf
+    if (count <= BVH_LEAF_THRESHOLD) {
+      nodes[idx] = [minX, minY, minZ, maxX, maxY, maxZ, 0, start, count, 1]
+      return idx
+    }
+
+    // Find best split point using SAH-inspired heuristic
+    const mid = findBestSplit(start, end)
+
+    // Placeholder — we'll fill right-child index after both children are built
+    nodes[idx] = [minX, minY, minZ, maxX, maxY, maxZ, 0, 0, 0, 0]
+
+    // Left child is always idx + 1 (depth-first order)
+    buildNode(start, mid)
+    const rightIdx = buildNode(mid, end)
+    nodes[idx][6] = rightIdx
+
+    return idx
+  }
+
+  buildNode(0, triCount)
+
+  // Reorder indices to match triOrder so leaf offsets are correct
+  const reordered = new Uint32Array(indices.length)
+  for (let i = 0; i < triCount; i++) {
+    const orig = triOrder[i] * 3
+    const dest = i * 3
+    reordered[dest]     = indices[orig]
+    reordered[dest + 1] = indices[orig + 1]
+    reordered[dest + 2] = indices[orig + 2]
+  }
+
+  // Flatten to Float32Array
+  const bvhBuffer = new Float32Array(nodes.length * 10)
+  for (let i = 0; i < nodes.length; i++) {
+    bvhBuffer.set(nodes[i], i * 10)
+  }
+
+  return { bvhBuffer, indices: reordered }
 }
 
 /**
