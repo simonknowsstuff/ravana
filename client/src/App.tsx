@@ -251,18 +251,33 @@ function App() {
   }, [])
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900">
-      {/* Header */}
-      <header className="p-6 border-b border-white/10">
+    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900 relative flex flex-col">
+      {/* Golden Grid Overlay */}
+      <div 
+        className="absolute inset-0 pointer-events-none"
+        style={{
+          opacity: 0.2,
+          backgroundImage: `
+            linear-gradient(rgba(212, 175, 55, 0.3) 1px, transparent 1px),
+            linear-gradient(90deg, rgba(212, 175, 55, 0.3) 1px, transparent 1px)
+          `,
+          backgroundSize: '40px 40px'
+        }}
+      />
+      
+      {/* Content wrapper - takes remaining space above footer */}
+      <div className="flex-1 flex flex-col">
+        {/* Header */}
+        <header className="p-6 border-b border-white/10 bg-slate-800 relative z-10">
         <h1 className="text-4xl font-bold text-white text-center">
           Ravana
         </h1>
         <p className="text-slate-400 text-center mt-2">
-          GLB Parser - Extract mesh data from GLTF/GLB files
+          Zero-install, browser-based compute farm.
         </p>
       </header>
 
-      <main className="container mx-auto p-6">
+        <main className="container mx-auto p-6 pb-30 relative z-10 flex-1">
         {/* Upload Section */}
         <div className="mb-8">
           <div
@@ -340,52 +355,6 @@ function App() {
             </div>
           )}
 
-          {/* Send to Workers Section */}
-          {glbData && (
-            <div className="mt-4 bg-slate-800 rounded-lg p-4">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center space-x-3">
-                  {/* Connection Status */}
-                  <div className={`w-3 h-3 rounded-full ${isConnected ? 'bg-green-500' : 'bg-red-500'}`} />
-                  <span className="text-slate-400 text-sm">
-                    {isConnected ? 'Connected to server' : 'Disconnected'}
-                  </span>
-                </div>
-                <button
-                  onClick={handleSendToWorkers}
-                  disabled={!isConnected || isSending}
-                  className={`px-4 py-2 rounded-lg font-medium transition-colors flex items-center space-x-2 ${
-                    isConnected && !isSending
-                      ? 'bg-cyan-500/20 text-cyan-400 hover:bg-cyan-500/30'
-                      : 'bg-slate-600/50 text-slate-500 cursor-not-allowed'
-                  }`}
-                >
-                  {isSending ? (
-                    <>
-                      <div className="w-4 h-4 border-2 border-cyan-400 border-t-transparent rounded-full animate-spin" />
-                      <span>Sending...</span>
-                    </>
-                  ) : (
-                    <>
-                      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
-                      </svg>
-                      <span>Send to Workers</span>
-                    </>
-                  )}
-                </button>
-              </div>
-              {/* Last Sent Payload Info */}
-              {lastSentPayload && (
-                <div className="mt-3 pt-3 border-t border-slate-700">
-                  <p className="text-xs text-slate-500">
-                    Last sent: {lastSentPayload.geometry.meshCount} meshes, {lastSentPayload.geometry.totalVertices.toLocaleString()} vertices
-                    {lastSentPayload.camera && ' + camera data'}
-                  </p>
-                </div>
-              )}
-            </div>
-          )}
 
           {/* 3D Viewer Toggle */}
           {fileName && (
@@ -410,6 +379,52 @@ function App() {
         {showViewer && currentFile && (
           <div className="mb-8 bg-slate-800 rounded-xl overflow-hidden" style={{ height: '400px' }}>
             <GLBViewer file={currentFile} onCameraSave={handleCameraSave} />
+          </div>
+        )}
+
+        {/* Saved Camera Data - below 3D viewer */}
+        {showViewer && currentFile && savedCameraData && (
+          <div className="mb-8 bg-blue-900/30 border border-blue-700/30 rounded-lg p-4">
+            <h3 className="text-blue-400 font-medium mb-3 flex items-center">
+              <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+              </svg>
+              Camera Data
+            </h3>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+              <div className="bg-slate-800 rounded p-3">
+                <span className="text-slate-400 block mb-1">Position</span>
+                <span className="text-blue-400 font-mono text-xs">
+                  x: {savedCameraData.position.x.toFixed(3)}<br/>
+                  y: {savedCameraData.position.y.toFixed(3)}<br/>
+                  z: {savedCameraData.position.z.toFixed(3)}
+                </span>
+              </div>
+              <div className="bg-slate-800 rounded p-3">
+                <span className="text-slate-400 block mb-1">Rotation</span>
+                <span className="text-blue-400 font-mono text-xs">
+                  x: {savedCameraData.rotation.x.toFixed(3)}<br/>
+                  y: {savedCameraData.rotation.y.toFixed(3)}<br/>
+                  z: {savedCameraData.rotation.z.toFixed(3)}
+                </span>
+              </div>
+              <div className="bg-slate-800 rounded p-3">
+                <span className="text-slate-400 block mb-1">Target</span>
+                <span className="text-blue-400 font-mono text-xs">
+                  x: {savedCameraData.target.x.toFixed(3)}<br/>
+                  y: {savedCameraData.target.y.toFixed(3)}<br/>
+                  z: {savedCameraData.target.z.toFixed(3)}
+                </span>
+              </div>
+              <div className="bg-slate-800 rounded p-3">
+                <span className="text-slate-400 block mb-1">Settings</span>
+                <span className="text-blue-400 font-mono text-xs">
+                  FOV: {savedCameraData.fov.toFixed(1)}°<br/>
+                  Near: {savedCameraData.near.toFixed(2)}<br/>
+                  Far: {savedCameraData.far.toFixed(1)}
+                </span>
+              </div>
+            </div>
           </div>
         )}
 
@@ -527,53 +542,75 @@ function App() {
             <p className="text-slate-400 text-sm">Float32Arrays for AO and vertex colors via three-mesh-bvh raycasting</p>
           </div>
         </div>
+        </main>
 
-        {/* Saved Camera Data */}
-        {savedCameraData && (
-          <div className="mt-8 bg-blue-900/30 border border-blue-700/30 rounded-lg p-4">
-            <h3 className="text-blue-400 font-medium mb-3 flex items-center">
-              <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
-              </svg>
-              Saved Camera Data
-            </h3>
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
-              <div className="bg-slate-800 rounded p-3">
-                <span className="text-slate-400 block mb-1">Position</span>
-                <span className="text-blue-400 font-mono text-xs">
-                  x: {savedCameraData.position.x.toFixed(3)}<br/>
-                  y: {savedCameraData.position.y.toFixed(3)}<br/>
-                  z: {savedCameraData.position.z.toFixed(3)}
-                </span>
-              </div>
-              <div className="bg-slate-800 rounded p-3">
-                <span className="text-slate-400 block mb-1">Rotation</span>
-                <span className="text-blue-400 font-mono text-xs">
-                  x: {savedCameraData.rotation.x.toFixed(3)}<br/>
-                  y: {savedCameraData.rotation.y.toFixed(3)}<br/>
-                  z: {savedCameraData.rotation.z.toFixed(3)}
-                </span>
-              </div>
-              <div className="bg-slate-800 rounded p-3">
-                <span className="text-slate-400 block mb-1">Target</span>
-                <span className="text-blue-400 font-mono text-xs">
-                  x: {savedCameraData.target.x.toFixed(3)}<br/>
-                  y: {savedCameraData.target.y.toFixed(3)}<br/>
-                  z: {savedCameraData.target.z.toFixed(3)}
-                </span>
-              </div>
-              <div className="bg-slate-800 rounded p-3">
-                <span className="text-slate-400 block mb-1">Settings</span>
-                <span className="text-blue-400 font-mono text-xs">
-                  FOV: {savedCameraData.fov.toFixed(1)}°<br/>
-                  Near: {savedCameraData.near.toFixed(2)}<br/>
-                  Far: {savedCameraData.far.toFixed(1)}
-                </span>
+        {/* Floating Send to Workers Button */}
+        {glbData && (
+          <div className="sticky bottom-0 pb-6 z-50 flex justify-center pointer-events-none">
+            <div className="w-[40%] min-w-[320px] pointer-events-auto">
+              <div className={`flex items-center justify-between rounded-2xl px-6 py-5 shadow-lg shadow-cyan-500/20 transition-all duration-300 ${
+                isConnected && !isSending
+                  ? 'bg-slate-800 border border-cyan-500/30'
+                  : 'bg-slate-800 border border-slate-600'
+              }`}>
+                {/* Status Side */}
+                <div className="flex flex-col space-y-1">
+                  <div className="flex items-center space-x-2">
+                    <div className={`w-3 h-3 rounded-full ${isConnected ? 'bg-green-500' : 'bg-red-500'}`} />
+                    <span className={`text-sm font-medium ${isConnected ? 'text-green-400' : 'text-red-400'}`}>
+                      {isConnected ? 'Connected' : 'Disconnected'}
+                    </span>
+                  </div>
+                  {lastSentPayload && (
+                    <p className="text-xs text-slate-500">
+                      Last: {lastSentPayload.geometry.meshCount} meshes, {lastSentPayload.geometry.totalVertices.toLocaleString()} verts
+                    </p>
+                  )}
+                </div>
+                {/* Button */}
+                <button
+                  onClick={handleSendToWorkers}
+                  disabled={!isConnected || isSending}
+                  className={`px-8 py-3 rounded-xl font-semibold text-lg transition-all duration-300 flex items-center space-x-3 ${
+                    isConnected && !isSending
+                      ? 'bg-cyan-500 text-white hover:bg-cyan-400 hover:scale-105'
+                      : 'bg-slate-600 text-slate-400 cursor-not-allowed'
+                  }`}
+                >
+                  {isSending ? (
+                    <>
+                      <div className="w-6 h-6 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                      <span>Sending...</span>
+                    </>
+                  ) : (
+                    <>
+                      <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                      </svg>
+                      <span>Send to Workers</span>
+                    </>
+                  )}
+                </button>
               </div>
             </div>
           </div>
         )}
-      </main>
+      </div>
+
+      {/* Footer */}
+      <footer className="bg-slate-900 border-t border-white/10 py-8 relative z-10">
+        <div className="container mx-auto px-6">
+          <div className="flex flex-col md:flex-row items-center justify-between">
+            <div className="text-center md:text-left mb-4 md:mb-0">
+              <h3 className="text-white font-bold text-lg">Ravana</h3>
+              <p className="text-slate-400 text-sm">Distributed rendering made simple</p>
+            </div>
+            <div className="text-slate-500 text-sm">
+              &copy; 2026 Ravana. All rights reserved.
+            </div>
+          </div>
+        </div>
+      </footer>
     </div>
   )
 }

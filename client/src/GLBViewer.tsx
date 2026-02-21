@@ -49,10 +49,12 @@ function SceneContent({ file, onCameraFound, onCameraSave, savedCameraRef, camer
   const controlsRef = useRef<any>(null)
   const glbCameraRef = useRef<THREE.Camera | null>(null)
 
-  // Track camera position in real-time
+  // Track camera position and auto-save in real-time
   useFrame(() => {
+    const perspCamera = camera as THREE.PerspectiveCamera
+    const target = controlsRef.current?.target || new THREE.Vector3()
+    
     if (onCameraUpdate) {
-      const target = controlsRef.current?.target || new THREE.Vector3()
       onCameraUpdate({
         position: {
           x: camera.position.x,
@@ -65,6 +67,40 @@ function SceneContent({ file, onCameraFound, onCameraSave, savedCameraRef, camer
           z: target.z,
         },
       })
+    }
+
+    // Auto-save camera data on every frame
+    if (onCameraSave) {
+      perspCamera.updateMatrixWorld(true)
+      perspCamera.updateProjectionMatrix()
+      
+      const cameraData: CameraData = {
+        position: {
+          x: perspCamera.position.x,
+          y: perspCamera.position.y,
+          z: perspCamera.position.z,
+        },
+        rotation: {
+          x: perspCamera.rotation.x,
+          y: perspCamera.rotation.y,
+          z: perspCamera.rotation.z,
+        },
+        fov: perspCamera.fov,
+        near: perspCamera.near,
+        far: perspCamera.far,
+        target: {
+          x: target.x,
+          y: target.y,
+          z: target.z,
+        },
+        timestamp: Date.now(),
+        viewMatrix: perspCamera.matrixWorldInverse.elements.slice(),
+        projectionMatrix: perspCamera.projectionMatrix.elements.slice(),
+        cameraMatrix: perspCamera.matrixWorld.elements.slice(),
+      }
+      
+      savedCameraRef.current = cameraData
+      onCameraSave(cameraData)
     }
   })
 
@@ -186,53 +222,6 @@ function SceneContent({ file, onCameraFound, onCameraSave, savedCameraRef, camer
     }
   }, [file])
 
-  // Save camera data function
-  const saveCurrentCamera = useCallback(() => {
-    const perspCamera = camera as THREE.PerspectiveCamera
-    const target = controlsRef.current?.target || new THREE.Vector3()
-    
-    // Update matrices before capturing
-    perspCamera.updateMatrixWorld(true)
-    perspCamera.updateProjectionMatrix()
-    
-    const cameraData: CameraData = {
-      position: {
-        x: perspCamera.position.x,
-        y: perspCamera.position.y,
-        z: perspCamera.position.z,
-      },
-      rotation: {
-        x: perspCamera.rotation.x,
-        y: perspCamera.rotation.y,
-        z: perspCamera.rotation.z,
-      },
-      fov: perspCamera.fov,
-      near: perspCamera.near,
-      far: perspCamera.far,
-      target: {
-        x: target.x,
-        y: target.y,
-        z: target.z,
-      },
-      timestamp: Date.now(),
-      // Capture matrices (column-major order as Three.js stores them)
-      viewMatrix: perspCamera.matrixWorldInverse.elements.slice(),
-      projectionMatrix: perspCamera.projectionMatrix.elements.slice(),
-      cameraMatrix: perspCamera.matrixWorld.elements.slice(),
-    }
-
-    savedCameraRef.current = cameraData
-    onCameraSave?.(cameraData)
-  }, [camera, onCameraSave, savedCameraRef])
-
-  // Expose save function via ref
-  useEffect(() => {
-    (window as any).__saveGLBViewerCamera = saveCurrentCamera
-    return () => {
-      delete (window as any).__saveGLBViewerCamera
-    }
-  }, [saveCurrentCamera])
-
   return (
     <>
       {/* Standard lighting setup */}
@@ -272,15 +261,8 @@ export default function GLBViewer({ file, onCameraSave }: GLBViewerProps) {
     setGlbCamera(camera)
   }, [])
 
-  const handleSaveCamera = useCallback(() => {
-    if ((window as any).__saveGLBViewerCamera) {
-      (window as any).__saveGLBViewerCamera()
-    }
-  }, [])
-
   const handleCameraSave = useCallback((cameraData: CameraData) => {
     onCameraSave?.(cameraData)
-    console.log('Camera data saved:', cameraData)
   }, [onCameraSave])
 
   return (
@@ -305,12 +287,6 @@ export default function GLBViewer({ file, onCameraSave }: GLBViewerProps) {
             }`}
           >
             Settings
-          </button>
-          <button
-            onClick={handleSaveCamera}
-            className="px-3 py-1.5 bg-purple-500/20 text-purple-400 rounded hover:bg-purple-500/30 transition-colors text-sm"
-          >
-            Save Camera
           </button>
         </div>
       </div>
