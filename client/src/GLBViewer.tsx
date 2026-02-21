@@ -243,7 +243,6 @@ function SceneContent({ file, onCameraFound, onCameraSave, savedCameraRef, camer
 
 export default function GLBViewer({ file, onCameraSave }: GLBViewerProps) {
   const [glbCamera, setGlbCamera] = useState<THREE.Camera | null>(null)
-  const [savedCamera, setSavedCamera] = useState<CameraData | null>(null)
   const savedCameraRef = useRef<CameraData | null>(null)
   const [showSettings, setShowSettings] = useState(false)
   const [cameraSettings, setCameraSettings] = useState<CameraSettings>({
@@ -268,23 +267,9 @@ export default function GLBViewer({ file, onCameraSave }: GLBViewerProps) {
   }, [])
 
   const handleCameraSave = useCallback((cameraData: CameraData) => {
-    setSavedCamera(cameraData)
     onCameraSave?.(cameraData)
     console.log('Camera data saved:', cameraData)
   }, [onCameraSave])
-
-  const handleExportCamera = useCallback(() => {
-    if (savedCamera) {
-      const dataStr = JSON.stringify(savedCamera, null, 2)
-      const blob = new Blob([dataStr], { type: 'application/json' })
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = `camera-data-${savedCamera.timestamp}.json`
-      a.click()
-      URL.revokeObjectURL(url)
-    }
-  }, [savedCamera])
 
   return (
     <div className="flex flex-col h-full">
@@ -315,14 +300,6 @@ export default function GLBViewer({ file, onCameraSave }: GLBViewerProps) {
           >
             Save Camera
           </button>
-          {savedCamera && (
-            <button
-              onClick={handleExportCamera}
-              className="px-3 py-1.5 bg-blue-500/20 text-blue-400 rounded hover:bg-blue-500/30 transition-colors text-sm"
-            >
-              Export JSON
-            </button>
-          )}
         </div>
       </div>
 
@@ -443,31 +420,6 @@ export default function GLBViewer({ file, onCameraSave }: GLBViewerProps) {
           <span className="text-slate-400">Controls:</span> Left-click + drag to rotate | Right-click + drag to pan | Scroll to zoom
         </p>
       </div>
-
-      {/* Camera Info Panel */}
-      {savedCamera && (
-        <div className="p-3 bg-slate-700/30 border-t border-slate-600">
-          <h4 className="text-sm font-medium text-slate-300 mb-2">Saved Camera Data</h4>
-          <div className="grid grid-cols-3 gap-2 text-xs">
-            <div className="bg-slate-800 rounded p-2">
-              <span className="text-slate-400">Position:</span>
-              <span className="text-purple-400 ml-1">
-                ({savedCamera.position.x.toFixed(2)}, {savedCamera.position.y.toFixed(2)}, {savedCamera.position.z.toFixed(2)})
-              </span>
-            </div>
-            <div className="bg-slate-800 rounded p-2">
-              <span className="text-slate-400">Target:</span>
-              <span className="text-purple-400 ml-1">
-                ({savedCamera.target.x.toFixed(2)}, {savedCamera.target.y.toFixed(2)}, {savedCamera.target.z.toFixed(2)})
-              </span>
-            </div>
-            <div className="bg-slate-800 rounded p-2">
-              <span className="text-slate-400">FOV:</span>
-              <span className="text-purple-400 ml-1">{savedCamera.fov.toFixed(1)}°</span>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   )
 }

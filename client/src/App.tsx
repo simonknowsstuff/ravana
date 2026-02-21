@@ -1,7 +1,8 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useRef, useEffect } from 'react'
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import * as THREE from 'three'
 import { MeshBVH, computeBoundsTree, disposeBoundsTree, acceleratedRaycast } from 'three-mesh-bvh'
+import { io, Socket } from 'socket.io-client'
 import GLBViewer, { CameraData } from './GLBViewer'
 
 // Add BVH methods to Three.js prototypes
@@ -35,6 +36,143 @@ interface MeshData {
 
 interface GLBData {
   meshes: MeshData[]
+}
+
+// Payload structure for websocket transmission
+interface ScenePayload {
+  timestamp: number
+  version: string
+  camera: {
+    position: { x: number; y: number; z: number }
+    rotation: { x: number; y: number; z: number }
+    target: { x: number; y: number; z: number }
+    fov: number
+    near: number
+    far: number
+  } | null
+  geometry: {
+    meshCount: number
+    totalVertices: number
+    totalIndices: number
+    meshes: Array<{
+      name: string
+      vertexCount: number
+      indexCount: number
+      hasNormals: boolean
+      hasUvs: boolean
+      hasBakedData: boolean
+      // Byte offsets in the binary buffer
+      positionsOffset: number
+      positionsLength: number
+      normalsOffset: number
+      normalsLength: number
+      uvsOffset: number
+      uvsLength: number
+      indicesOffset: number
+      indicesLength: number
+      aoOffset: number
+      aoLength: number
+      vertexColorsOffset: number
+      vertexColorsLength: number
+    }>
+  }
+}
+
+// Compile scene data into a binary buffer for efficient transmission
+function compileSceneData(glbData: GLBData, cameraData: CameraData | null): { metadata: ScenePayload; buffer: ArrayBuffer } {
+  // Calculate total buffer size needed
+  let totalBytes = 0
+  const meshOffsets: ScenePayload['geometry']['meshes'] = []
+  
+  for (const mesh of glbData.meshes) {
+    const positionsLength = mesh.positions.byteLength
+    const normalsLength = mesh.normals?.byteLength ?? 0
+    const uvsLength = mesh.uvs?.byteLength ?? 0
+    const indicesLength = mesh.indices?.byteLength ?? 0
+    const aoLength = mesh.bakedData?.ambientOcclusion.byteLength ?? 0
+    const vertexColorsLength = mesh.bakedData?.vertexColors.byteLength ?? 0
+    
+    meshOffsets.push({
+      name: mesh.name,
+      vertexCount: mesh.positions.length / 3,
+      indexCount: mesh.indices?.length ?? 0,
+      hasNormals: !!mesh.normals,
+      hasUvs: !!mesh.uvs,
+      hasBakedData: !!mesh.bakedData,
+      positionsOffset: totalBytes,
+      positionsLength,
+      normalsOffset: totalBytes + positionsLength,
+      normalsLength,
+      uvsOffset: totalBytes + positionsLength + normalsLength,
+      uvsLength,
+      indicesOffset: totalBytes + positionsLength + normalsLength + uvsLength,
+      indicesLength,
+      aoOffset: totalBytes + positionsLength + normalsLength + uvsLength + indicesLength,
+      aoLength,
+      vertexColorsOffset: totalBytes + positionsLength + normalsLength + uvsLength + indicesLength + aoLength,
+      vertexColorsLength,
+    })
+    
+    totalBytes += positionsLength + normalsLength + uvsLength + indicesLength + aoLength + vertexColorsLength
+  }
+  
+  // Create the binary buffer
+  const buffer = new ArrayBuffer(totalBytes)
+  const view = new Uint8Array(buffer)
+  
+  let offset = 0
+  for (const mesh of glbData.meshes) {
+    // Copy positions
+    view.set(new Uint8Array(mesh.positions.buffer), offset)
+    offset += mesh.positions.byteLength
+    
+    // Copy normals
+    if (mesh.normals) {
+      view.set(new Uint8Array(mesh.normals.buffer), offset)
+      offset += mesh.normals.byteLength
+    }
+    
+    // Copy UVs
+    if (mesh.uvs) {
+      view.set(new Uint8Array(mesh.uvs.buffer), offset)
+      offset += mesh.uvs.byteLength
+    }
+    
+    // Copy indices
+    if (mesh.indices) {
+      view.set(new Uint8Array(mesh.indices.buffer), offset)
+      offset += mesh.indices.byteLength
+    }
+    
+    // Copy baked data
+    if (mesh.bakedData) {
+      view.set(new Uint8Array(mesh.bakedData.ambientOcclusion.buffer), offset)
+      offset += mesh.bakedData.ambientOcclusion.byteLength
+      view.set(new Uint8Array(mesh.bakedData.vertexColors.buffer), offset)
+      offset += mesh.bakedData.vertexColors.byteLength
+    }
+  }
+  
+  const metadata: ScenePayload = {
+    timestamp: Date.now(),
+    version: '1.0.0',
+    camera: cameraData ? {
+      position: cameraData.position,
+      rotation: cameraData.rotation,
+      target: cameraData.target,
+      fov: cameraData.fov,
+      near: cameraData.near,
+      far: cameraData.far,
+    } : null,
+    geometry: {
+      meshCount: glbData.meshes.length,
+      totalVertices: glbData.meshes.reduce((sum, m) => sum + m.positions.length / 3, 0),
+      totalIndices: glbData.meshes.reduce((sum, m) => sum + (m.indices?.length ?? 0), 0),
+      meshes: meshOffsets,
+    },
+  }
+  
+  return { metadata, buffer }
 }
 
 interface BakeOptions {
@@ -237,6 +375,59 @@ function App() {
   const [currentFile, setCurrentFile] = useState<File | null>(null)
   const [savedCameraData, setSavedCameraData] = useState<CameraData | null>(null)
   const [showViewer, setShowViewer] = useState(true)
+  
+  // WebSocket state
+  const socketRef = useRef<Socket | null>(null)
+  const [isConnected, setIsConnected] = useState(false)
+  const [isSending, setIsSending] = useState(false)
+  const [lastSentPayload, setLastSentPayload] = useState<ScenePayload | null>(null)
+
+  // Initialize WebSocket connection
+  useEffect(() => {
+    const serverUrl = import.meta.env.VITE_WS_SERVER_URL || 'http://localhost:3001'
+    const socket = io(serverUrl)
+    socketRef.current = socket
+
+    socket.on('connect', () => {
+      console.log('[socket] connected:', socket.id)
+      setIsConnected(true)
+      socket.emit('register_dashboard')
+    })
+
+    socket.on('disconnect', () => {
+      console.log('[socket] disconnected')
+      setIsConnected(false)
+    })
+
+    return () => {
+      socket.disconnect()
+    }
+  }, [])
+
+  // Compile and send scene data to workers
+  const handleSendToWorkers = useCallback(() => {
+    if (!glbData || !socketRef.current || !isConnected) return
+
+    setIsSending(true)
+    try {
+      const { metadata, buffer } = compileSceneData(glbData, savedCameraData)
+      
+      // Send metadata first, then binary buffer
+      socketRef.current.emit('sync_geometry', {
+        type: 'scene_payload',
+        metadata,
+        buffer,
+      })
+      
+      setLastSentPayload(metadata)
+      console.log('[socket] sent scene payload:', metadata)
+      console.log('[socket] binary buffer size:', buffer.byteLength, 'bytes')
+    } catch (error) {
+      console.error('[socket] failed to send:', error)
+    } finally {
+      setIsSending(false)
+    }
+  }, [glbData, savedCameraData, isConnected])
 
   const handleFileUpload = useCallback(async (file: File) => {
     if (file && (file.name.endsWith('.gltf') || file.name.endsWith('.glb'))) {
@@ -389,6 +580,53 @@ function App() {
               >
                 Remove
               </button>
+            </div>
+          )}
+
+          {/* Send to Workers Section */}
+          {glbData && (
+            <div className="mt-4 bg-slate-800 rounded-lg p-4">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center space-x-3">
+                  {/* Connection Status */}
+                  <div className={`w-3 h-3 rounded-full ${isConnected ? 'bg-green-500' : 'bg-red-500'}`} />
+                  <span className="text-slate-400 text-sm">
+                    {isConnected ? 'Connected to server' : 'Disconnected'}
+                  </span>
+                </div>
+                <button
+                  onClick={handleSendToWorkers}
+                  disabled={!isConnected || isSending}
+                  className={`px-4 py-2 rounded-lg font-medium transition-colors flex items-center space-x-2 ${
+                    isConnected && !isSending
+                      ? 'bg-cyan-500/20 text-cyan-400 hover:bg-cyan-500/30'
+                      : 'bg-slate-600/50 text-slate-500 cursor-not-allowed'
+                  }`}
+                >
+                  {isSending ? (
+                    <>
+                      <div className="w-4 h-4 border-2 border-cyan-400 border-t-transparent rounded-full animate-spin" />
+                      <span>Sending...</span>
+                    </>
+                  ) : (
+                    <>
+                      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                      </svg>
+                      <span>Send to Workers</span>
+                    </>
+                  )}
+                </button>
+              </div>
+              {/* Last Sent Payload Info */}
+              {lastSentPayload && (
+                <div className="mt-3 pt-3 border-t border-slate-700">
+                  <p className="text-xs text-slate-500">
+                    Last sent: {lastSentPayload.geometry.meshCount} meshes, {lastSentPayload.geometry.totalVertices.toLocaleString()} vertices
+                    {lastSentPayload.camera && ' + camera data'}
+                  </p>
+                </div>
+              )}
             </div>
           )}
 
