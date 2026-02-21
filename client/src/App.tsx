@@ -1,26 +1,265 @@
-import { useState, useCallback, Suspense } from 'react'
-import { Canvas } from '@react-three/fiber'
-import { OrbitControls, useGLTF, Environment, Center } from '@react-three/drei'
+import { useState, useCallback } from 'react'
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
+import * as THREE from 'three'
+import { MeshBVH, computeBoundsTree, disposeBoundsTree, acceleratedRaycast } from 'three-mesh-bvh'
+import GLBViewer, { CameraData } from './GLBViewer'
 
-interface ModelProps {
-  url: string
+// Add BVH methods to Three.js prototypes
+THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree
+THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree
+THREE.Mesh.prototype.raycast = acceleratedRaycast
+
+declare module 'three' {
+  interface BufferGeometry {
+    boundsTree?: MeshBVH
+    computeBoundsTree: typeof computeBoundsTree
+    disposeBoundsTree: typeof disposeBoundsTree
+  }
 }
 
-function Model({ url }: ModelProps) {
-  const { scene } = useGLTF(url)
-  return <primitive object={scene} />
+interface BakedData {
+  ambientOcclusion: Float32Array
+  vertexColors: Float32Array
+  bvhNodeCount: number
+  raycastSamples: number
+}
+
+interface MeshData {
+  name: string
+  positions: Float32Array
+  normals: Float32Array | null
+  uvs: Float32Array | null
+  indices: Uint16Array | Uint32Array | null
+  bakedData?: BakedData
+}
+
+interface GLBData {
+  meshes: MeshData[]
+}
+
+interface BakeOptions {
+  samples: number
+  maxDistance: number
+  intensity: number
+}
+
+function bakeMeshWithBVH(
+  geometry: THREE.BufferGeometry,
+  sceneRoot: THREE.Object3D,
+  options: BakeOptions = { samples: 64, maxDistance: 2.0, intensity: 1.0 }
+): BakedData {
+  // Build BVH for the geometry
+  geometry.computeBoundsTree()
+  
+  const positionAttr = geometry.attributes.position
+  const normalAttr = geometry.attributes.normal
+  const vertexCount = positionAttr.count
+  
+  // Create Float32Arrays for baked data
+  const ambientOcclusion = new Float32Array(vertexCount)
+  const vertexColors = new Float32Array(vertexCount * 3) // RGB per vertex
+  
+  // Create raycaster for BVH-accelerated raycasting
+  const raycaster = new THREE.Raycaster()
+  raycaster.firstHitOnly = true
+  
+  const position = new THREE.Vector3()
+  const normal = new THREE.Vector3()
+  const rayDirection = new THREE.Vector3()
+  
+  // Collect all meshes in scene for raycasting
+  const meshes: THREE.Mesh[] = []
+  sceneRoot.traverse((obj) => {
+    if (obj instanceof THREE.Mesh && obj.geometry.boundsTree) {
+      meshes.push(obj)
+    }
+  })
+  
+  // Sample directions on hemisphere using Fibonacci sphere
+  const sampleDirections: THREE.Vector3[] = []
+  const goldenRatio = (1 + Math.sqrt(5)) / 2
+  for (let i = 0; i < options.samples; i++) {
+    const theta = 2 * Math.PI * i / goldenRatio
+    const phi = Math.acos(1 - (2 * (i + 0.5)) / options.samples)
+    sampleDirections.push(new THREE.Vector3(
+      Math.cos(theta) * Math.sin(phi),
+      Math.sin(theta) * Math.sin(phi),
+      Math.cos(phi)
+    ))
+  }
+  
+  // Bake ambient occlusion per vertex
+  for (let i = 0; i < vertexCount; i++) {
+    position.fromBufferAttribute(positionAttr, i)
+    
+    if (normalAttr) {
+      normal.fromBufferAttribute(normalAttr, i)
+    } else {
+      normal.set(0, 1, 0)
+    }
+    
+    // Create tangent space basis for hemisphere sampling
+    const tangent = new THREE.Vector3()
+    const bitangent = new THREE.Vector3()
+    
+    if (Math.abs(normal.y) < 0.99) {
+      tangent.crossVectors(normal, new THREE.Vector3(0, 1, 0)).normalize()
+    } else {
+      tangent.crossVectors(normal, new THREE.Vector3(1, 0, 0)).normalize()
+    }
+    bitangent.crossVectors(normal, tangent)
+    
+    let occlusionSum = 0
+    let validSamples = 0
+    
+    // Cast rays in hemisphere above the surface
+    for (const sampleDir of sampleDirections) {
+      // Transform sample direction from hemisphere to world space
+      if (sampleDir.z < 0) continue // Only upper hemisphere
+      
+      rayDirection.set(0, 0, 0)
+        .addScaledVector(tangent, sampleDir.x)
+        .addScaledVector(bitangent, sampleDir.y)
+        .addScaledVector(normal, sampleDir.z)
+        .normalize()
+      
+      // Offset ray origin slightly to avoid self-intersection
+      const rayOrigin = position.clone().addScaledVector(normal, 0.001)
+      raycaster.set(rayOrigin, rayDirection)
+      raycaster.far = options.maxDistance
+      
+      // Check for intersections using BVH
+      let occluded = false
+      for (const mesh of meshes) {
+        const hits = raycaster.intersectObject(mesh, false)
+        if (hits.length > 0 && hits[0].distance < options.maxDistance) {
+          occluded = true
+          // Weighted by distance - closer = more occlusion
+          occlusionSum += 1 - (hits[0].distance / options.maxDistance)
+          break
+        }
+      }
+      
+      if (!occluded) {
+        validSamples++
+      }
+    }
+    
+    // Calculate AO value (0 = fully occluded, 1 = fully visible)
+    const totalHemisphereSamples = sampleDirections.filter(d => d.z >= 0).length
+    const aoValue = validSamples / totalHemisphereSamples
+    ambientOcclusion[i] = Math.pow(aoValue, options.intensity)
+    
+    // Generate vertex colors from AO (grayscale)
+    const colorValue = ambientOcclusion[i]
+    vertexColors[i * 3] = colorValue     // R
+    vertexColors[i * 3 + 1] = colorValue // G
+    vertexColors[i * 3 + 2] = colorValue // B
+  }
+  
+  return {
+    ambientOcclusion,
+    vertexColors,
+    bvhNodeCount: 1, // BVH tree built internally
+    raycastSamples: options.samples
+  }
+}
+
+async function extractGLBData(file: File, shouldBake: boolean = false): Promise<GLBData> {
+  const loader = new GLTFLoader()
+  const url = URL.createObjectURL(file)
+  
+  try {
+    const gltf = await loader.loadAsync(url)
+    const meshes: MeshData[] = []
+    
+    // Build BVH for all meshes first if baking
+    if (shouldBake) {
+      gltf.scene.traverse((child) => {
+        if (child instanceof THREE.Mesh) {
+          const geometry = child.geometry as THREE.BufferGeometry
+          geometry.computeBoundsTree()
+        }
+      })
+    }
+    
+    gltf.scene.traverse((child) => {
+      if (child instanceof THREE.Mesh) {
+        const geometry = child.geometry as THREE.BufferGeometry
+        
+        // Bake mesh data using BVH if requested
+        let bakedData: BakedData | undefined
+        if (shouldBake) {
+          bakedData = bakeMeshWithBVH(geometry, gltf.scene, {
+            samples: 64,
+            maxDistance: 2.0,
+            intensity: 1.0
+          })
+        }
+        
+        const meshData: MeshData = {
+          name: child.name || `mesh_${meshes.length}`,
+          positions: new Float32Array(geometry.attributes.position.array),
+          normals: geometry.attributes.normal 
+            ? new Float32Array(geometry.attributes.normal.array) 
+            : null,
+          uvs: geometry.attributes.uv 
+            ? new Float32Array(geometry.attributes.uv.array) 
+            : null,
+          indices: geometry.index 
+            ? (geometry.index.array instanceof Uint16Array 
+                ? new Uint16Array(geometry.index.array) 
+                : new Uint32Array(geometry.index.array))
+            : null,
+          bakedData
+        }
+        meshes.push(meshData)
+        
+        // Clean up BVH
+        if (geometry.boundsTree) {
+          geometry.disposeBoundsTree()
+        }
+      }
+    })
+    
+    return { meshes }
+  } finally {
+    URL.revokeObjectURL(url)
+  }
 }
 
 function App() {
-  const [gltfUrl, setGltfUrl] = useState<string | null>(null)
   const [fileName, setFileName] = useState<string>('')
   const [isDragging, setIsDragging] = useState(false)
+  const [glbData, setGlbData] = useState<GLBData | null>(null)
+  const [isLoading, setIsLoading] = useState(false)
+  const [bakingProgress, setBakingProgress] = useState<string>('')
+  const [currentFile, setCurrentFile] = useState<File | null>(null)
+  const [savedCameraData, setSavedCameraData] = useState<CameraData | null>(null)
+  const [showViewer, setShowViewer] = useState(true)
 
-  const handleFileUpload = useCallback((file: File) => {
+  const handleFileUpload = useCallback(async (file: File) => {
     if (file && (file.name.endsWith('.gltf') || file.name.endsWith('.glb'))) {
-      const url = URL.createObjectURL(file)
-      setGltfUrl(url)
+      setIsLoading(true)
       setFileName(file.name)
+      setCurrentFile(file)
+      setBakingProgress('Building BVH and baking...')
+      try {
+        const data = await extractGLBData(file, true)
+        setGlbData(data)
+        console.log('Extracted GLB data:', data)
+        console.log('Baked Float32Arrays:', data.meshes.map(m => ({
+          name: m.name,
+          ambientOcclusion: m.bakedData?.ambientOcclusion,
+          vertexColors: m.bakedData?.vertexColors
+        })))
+      } catch (error) {
+        console.error('Failed to parse GLB file:', error)
+        alert('Failed to parse the file')
+      } finally {
+        setIsLoading(false)
+        setBakingProgress('')
+      }
     } else {
       alert('Please upload a valid .gltf or .glb file')
     }
@@ -53,12 +292,15 @@ function App() {
   }, [handleFileUpload])
 
   const handleClear = useCallback(() => {
-    if (gltfUrl) {
-      URL.revokeObjectURL(gltfUrl)
-    }
-    setGltfUrl(null)
+    setGlbData(null)
     setFileName('')
-  }, [gltfUrl])
+    setCurrentFile(null)
+    setSavedCameraData(null)
+  }, [])
+
+  const handleCameraSave = useCallback((cameraData: CameraData) => {
+    setSavedCameraData(cameraData)
+  }, [])
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900">
@@ -68,7 +310,7 @@ function App() {
           Ravana
         </h1>
         <p className="text-slate-400 text-center mt-2">
-          3D Model Viewer - Upload your GLTF/GLB files
+          GLB Parser - Extract mesh data from GLTF/GLB files
         </p>
       </header>
 
@@ -149,28 +391,104 @@ function App() {
               </button>
             </div>
           )}
+
+          {/* 3D Viewer Toggle */}
+          {fileName && (
+            <div className="mt-4 flex items-center space-x-3 bg-slate-800/50 rounded-lg p-4">
+              <label className="flex items-center space-x-3 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={showViewer}
+                  onChange={(e) => setShowViewer(e.target.checked)}
+                  className="w-5 h-5 rounded border-slate-600 bg-slate-700 text-purple-500 focus:ring-purple-500 focus:ring-offset-slate-900"
+                />
+                <div>
+                  <span className="text-white font-medium">Show 3D Viewer</span>
+                  <p className="text-slate-400 text-sm">Low quality preview with camera detection</p>
+                </div>
+              </label>
+            </div>
+          )}
         </div>
 
-        {/* 3D Viewer */}
-        <div className="bg-slate-800 rounded-xl overflow-hidden" style={{ height: '500px' }}>
-          {gltfUrl ? (
-            <Canvas camera={{ position: [0, 2, 5], fov: 50 }}>
-              <ambientLight intensity={0.5} />
-              <directionalLight position={[10, 10, 5]} intensity={1} />
-              <Suspense fallback={null}>
-                <Center>
-                  <Model url={gltfUrl} />
-                </Center>
-                <Environment preset="city" />
-              </Suspense>
-              <OrbitControls
-                enablePan={true}
-                enableZoom={true}
-                enableRotate={true}
-              />
-            </Canvas>
-          ) : (
+        {/* 3D Viewer Section */}
+        {showViewer && currentFile && (
+          <div className="mb-8 bg-slate-800 rounded-xl overflow-hidden" style={{ height: '400px' }}>
+            <GLBViewer file={currentFile} onCameraSave={handleCameraSave} />
+          </div>
+        )}
+
+        {/* Data Display */}
+        <div className="bg-slate-800 rounded-xl overflow-hidden p-6" style={{ minHeight: '300px' }}>
+          {isLoading ? (
             <div className="w-full h-full flex items-center justify-center">
+              <div className="text-center">
+                <div className="w-12 h-12 mx-auto border-4 border-purple-500 border-t-transparent rounded-full animate-spin mb-4"></div>
+                <p className="text-slate-400">{bakingProgress || 'Processing...'}</p>
+              </div>
+            </div>
+          ) : glbData ? (
+            <div className="space-y-4">
+              <h2 className="text-xl font-semibold text-white">
+                Extracted Meshes ({glbData.meshes.length})
+              </h2>
+              <div className="space-y-3 max-h-96 overflow-y-auto">
+                {glbData.meshes.map((mesh, index) => (
+                  <div key={index} className="bg-slate-700 rounded-lg p-4">
+                    <h3 className="text-white font-medium mb-2">{mesh.name}</h3>
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-sm">
+                      <div className="bg-slate-600 rounded p-2">
+                        <span className="text-slate-400">Positions:</span>
+                        <span className="text-purple-400 ml-2">{mesh.positions.length / 3} vertices</span>
+                      </div>
+                      <div className="bg-slate-600 rounded p-2">
+                        <span className="text-slate-400">Normals:</span>
+                        <span className="text-purple-400 ml-2">{mesh.normals ? mesh.normals.length / 3 : 'N/A'}</span>
+                      </div>
+                      <div className="bg-slate-600 rounded p-2">
+                        <span className="text-slate-400">UVs:</span>
+                        <span className="text-purple-400 ml-2">{mesh.uvs ? mesh.uvs.length / 2 : 'N/A'}</span>
+                      </div>
+                      <div className="bg-slate-600 rounded p-2">
+                        <span className="text-slate-400">Indices:</span>
+                        <span className="text-purple-400 ml-2">{mesh.indices ? mesh.indices.length : 'N/A'}</span>
+                      </div>
+                    </div>
+                    {/* Baked Data Display */}
+                    {mesh.bakedData && (
+                      <div className="mt-3 pt-3 border-t border-slate-600">
+                        <h4 className="text-green-400 font-medium mb-2 flex items-center">
+                          <svg className="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                          </svg>
+                          BVH Baked Data (Float32Arrays)
+                        </h4>
+                        <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-sm">
+                          <div className="bg-green-900/30 border border-green-700/50 rounded p-2">
+                            <span className="text-slate-400">AO Array:</span>
+                            <span className="text-green-400 ml-2">{mesh.bakedData.ambientOcclusion.length} floats</span>
+                          </div>
+                          <div className="bg-green-900/30 border border-green-700/50 rounded p-2">
+                            <span className="text-slate-400">Vertex Colors:</span>
+                            <span className="text-green-400 ml-2">{mesh.bakedData.vertexColors.length} floats</span>
+                          </div>
+                          <div className="bg-green-900/30 border border-green-700/50 rounded p-2">
+                            <span className="text-slate-400">BVH Nodes:</span>
+                            <span className="text-green-400 ml-2">{mesh.bakedData.bvhNodeCount}</span>
+                          </div>
+                          <div className="bg-green-900/30 border border-green-700/50 rounded p-2">
+                            <span className="text-slate-400">Ray Samples:</span>
+                            <span className="text-green-400 ml-2">{mesh.bakedData.raycastSamples}</span>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : (
+            <div className="w-full h-full flex items-center justify-center" style={{ minHeight: '200px' }}>
               <div className="text-center">
                 <div className="w-20 h-20 mx-auto rounded-full bg-slate-700 flex items-center justify-center mb-4">
                   <svg
@@ -183,33 +501,83 @@ function App() {
                       strokeLinecap="round"
                       strokeLinejoin="round"
                       strokeWidth={2}
-                      d="M14 10l-2 1m0 0l-2-1m2 1v2.5M20 7l-2 1m2-1l-2-1m2 1v2.5M14 4l-2-1-2 1M4 7l2-1M4 7l2 1M4 7v2.5M12 21l-2-1m2 1l2-1m-2 1v-2.5M6 18l-2-1v-2.5M18 18l2-1v-2.5"
+                      d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4"
                     />
                   </svg>
                 </div>
                 <p className="text-slate-400">
-                  Upload a 3D model to view it here
+                  Upload a GLB file to extract mesh data
                 </p>
               </div>
             </div>
           )}
         </div>
 
-        {/* Instructions */}
-        <div className="mt-8 grid grid-cols-1 md:grid-cols-3 gap-4">
+        {/* Info */}
+        <div className="mt-8 grid grid-cols-1 md:grid-cols-4 gap-4">
           <div className="bg-slate-800/50 rounded-lg p-4">
-            <h3 className="text-white font-medium mb-2">Rotate</h3>
-            <p className="text-slate-400 text-sm">Left-click and drag to rotate the model</p>
+            <h3 className="text-white font-medium mb-2">Positions</h3>
+            <p className="text-slate-400 text-sm">Float32Array of vertex positions (x, y, z)</p>
           </div>
           <div className="bg-slate-800/50 rounded-lg p-4">
-            <h3 className="text-white font-medium mb-2">Zoom</h3>
-            <p className="text-slate-400 text-sm">Scroll to zoom in and out</p>
+            <h3 className="text-white font-medium mb-2">Normals</h3>
+            <p className="text-slate-400 text-sm">Float32Array of vertex normals for lighting</p>
           </div>
           <div className="bg-slate-800/50 rounded-lg p-4">
-            <h3 className="text-white font-medium mb-2">Pan</h3>
-            <p className="text-slate-400 text-sm">Right-click and drag to pan the view</p>
+            <h3 className="text-white font-medium mb-2">UVs & Indices</h3>
+            <p className="text-slate-400 text-sm">Texture coordinates and triangle indices</p>
+          </div>
+          <div className="bg-green-900/30 border border-green-700/30 rounded-lg p-4">
+            <h3 className="text-green-400 font-medium mb-2">BVH Baked Data</h3>
+            <p className="text-slate-400 text-sm">Float32Arrays for AO and vertex colors via three-mesh-bvh raycasting</p>
           </div>
         </div>
+
+        {/* Saved Camera Data */}
+        {savedCameraData && (
+          <div className="mt-8 bg-blue-900/30 border border-blue-700/30 rounded-lg p-4">
+            <h3 className="text-blue-400 font-medium mb-3 flex items-center">
+              <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+              </svg>
+              Saved Camera Data
+            </h3>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+              <div className="bg-slate-800 rounded p-3">
+                <span className="text-slate-400 block mb-1">Position</span>
+                <span className="text-blue-400 font-mono text-xs">
+                  x: {savedCameraData.position.x.toFixed(3)}<br/>
+                  y: {savedCameraData.position.y.toFixed(3)}<br/>
+                  z: {savedCameraData.position.z.toFixed(3)}
+                </span>
+              </div>
+              <div className="bg-slate-800 rounded p-3">
+                <span className="text-slate-400 block mb-1">Rotation</span>
+                <span className="text-blue-400 font-mono text-xs">
+                  x: {savedCameraData.rotation.x.toFixed(3)}<br/>
+                  y: {savedCameraData.rotation.y.toFixed(3)}<br/>
+                  z: {savedCameraData.rotation.z.toFixed(3)}
+                </span>
+              </div>
+              <div className="bg-slate-800 rounded p-3">
+                <span className="text-slate-400 block mb-1">Target</span>
+                <span className="text-blue-400 font-mono text-xs">
+                  x: {savedCameraData.target.x.toFixed(3)}<br/>
+                  y: {savedCameraData.target.y.toFixed(3)}<br/>
+                  z: {savedCameraData.target.z.toFixed(3)}
+                </span>
+              </div>
+              <div className="bg-slate-800 rounded p-3">
+                <span className="text-slate-400 block mb-1">Settings</span>
+                <span className="text-blue-400 font-mono text-xs">
+                  FOV: {savedCameraData.fov.toFixed(1)}°<br/>
+                  Near: {savedCameraData.near.toFixed(2)}<br/>
+                  Far: {savedCameraData.far.toFixed(1)}
+                </span>
+              </div>
+            </div>
+          </div>
+        )}
       </main>
     </div>
   )
