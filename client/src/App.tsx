@@ -131,8 +131,10 @@ function App() {
 
   // Initialize WebSocket connection
   useEffect(() => {
-    const serverUrl = import.meta.env.VITE_WS_SERVER_URL || 'http://localhost:3001'
-    const socket = io(serverUrl)
+    const serverUrl = import.meta.env.VITE_WS_SERVER_URL || `http://${window.location.hostname}:3000`;
+    const socket = io(serverUrl,{
+      transports:['websocket']
+  });
     socketRef.current = socket
 
     socket.on('connect', () => {
