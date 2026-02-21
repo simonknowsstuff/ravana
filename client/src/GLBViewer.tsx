@@ -12,6 +12,10 @@ interface CameraData {
   far: number
   target: { x: number; y: number; z: number }
   timestamp: number
+  // Matrices for ray tracing (column-major, 16 floats each)
+  viewMatrix: number[]          // camera.matrixWorldInverse - world to view space
+  projectionMatrix: number[]    // camera.projectionMatrix - view to clip space
+  cameraMatrix: number[]        // camera.matrixWorld - camera to world (for ray generation)
 }
 
 interface GLBViewerProps {
@@ -187,6 +191,10 @@ function SceneContent({ file, onCameraFound, onCameraSave, savedCameraRef, camer
     const perspCamera = camera as THREE.PerspectiveCamera
     const target = controlsRef.current?.target || new THREE.Vector3()
     
+    // Update matrices before capturing
+    perspCamera.updateMatrixWorld(true)
+    perspCamera.updateProjectionMatrix()
+    
     const cameraData: CameraData = {
       position: {
         x: perspCamera.position.x,
@@ -207,6 +215,10 @@ function SceneContent({ file, onCameraFound, onCameraSave, savedCameraRef, camer
         z: target.z,
       },
       timestamp: Date.now(),
+      // Capture matrices (column-major order as Three.js stores them)
+      viewMatrix: perspCamera.matrixWorldInverse.elements.slice(),
+      projectionMatrix: perspCamera.projectionMatrix.elements.slice(),
+      cameraMatrix: perspCamera.matrixWorld.elements.slice(),
     }
 
     savedCameraRef.current = cameraData

@@ -44,12 +44,17 @@ interface ScenePayload {
   timestamp: number
   version: string
   camera: {
+    // Legacy position/rotation for debugging
     position: { x: number; y: number; z: number }
-    rotation: { x: number; y: number; z: number }
     target: { x: number; y: number; z: number }
+    // Camera parameters
     fov: number
     near: number
     far: number
+    // Matrices for ray tracing (column-major, 16 floats each)
+    viewMatrix: number[]        // World to view space
+    projectionMatrix: number[]  // View to clip space  
+    cameraMatrix: number[]      // Camera to world (for ray origin/direction)
   } | null
   geometry: {
     meshCount: number
@@ -203,11 +208,13 @@ function compileSceneData(glbData: GLBData, cameraData: CameraData | null): { me
     version: '1.0.0',
     camera: cameraData ? {
       position: cameraData.position,
-      rotation: cameraData.rotation,
       target: cameraData.target,
       fov: cameraData.fov,
       near: cameraData.near,
       far: cameraData.far,
+      viewMatrix: cameraData.viewMatrix,
+      projectionMatrix: cameraData.projectionMatrix,
+      cameraMatrix: cameraData.cameraMatrix,
     } : null,
     geometry: {
       meshCount: glbData.meshes.length,
