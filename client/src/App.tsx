@@ -2,6 +2,7 @@ import { useState, useCallback, useRef, useEffect } from 'react'
 import { io, Socket } from 'socket.io-client'
 import GLBViewer, { CameraData } from './GLBViewer'
 import { GLBData, extractGLBData } from './hooks/useGLBData'
+import { useCanvasExporter } from './hooks'
 import { ScenePayload } from './types'
 
 // Compile scene data into a binary buffer for efficient transmission
@@ -181,23 +182,16 @@ function App() {
 
   // Render canvas state
   const canvasRef = useRef<HTMLCanvasElement>(null)
+  const exportCanvas = useCanvasExporter(canvasRef) // hook for exporting PNG
   const [isRendering, setIsRendering] = useState(false)
   const [tilesReceived, setTilesReceived] = useState(0)
   const [totalTiles, setTotalTiles] = useState(0)
   const [renderStartTime, setRenderStartTime] = useState<number | null>(null)
   const [renderElapsed, setRenderElapsed] = useState<string>('')
-  // Derive render resolution from camera aspect ratio (projection matrix)
-  const baseHeight = 600
-  const cameraAspect = (() => {
-    if (savedCameraData?.projectionMatrix) {
-      const p = savedCameraData.projectionMatrix
-      // proj[5] = 1/tan(fov/2), proj[0] = 1/(aspect*tan(fov/2)) → aspect = p[5]/p[0]
-      if (p[0] !== 0) return p[5] / p[0]
-    }
-    return 16 / 9
-  })()
-  const RENDER_WIDTH = Math.round(baseHeight * cameraAspect)
-  const RENDER_HEIGHT = baseHeight
+
+  // fixed resolution for all renders
+  const RENDER_WIDTH = 1280
+  const RENDER_HEIGHT = 720
 
   // Initialize WebSocket connection
   useEffect(() => {
@@ -510,7 +504,9 @@ function App() {
                 />
                 <div>
                   <span className="text-white font-medium">Show 3D Viewer</span>
-                  <p className="text-slate-400 text-sm">Low quality preview with camera detection</p>
+                  <p className="text-slate-400 text-sm">
+                    Low quality preview (maintains 8:3 aspect ratio)
+                  </p>
                 </div>
               </label>
             </div>
@@ -519,7 +515,15 @@ function App() {
 
         {/* 3D Viewer Section */}
         {showViewer && currentFile && (
-          <div className="mb-8 bg-slate-800 rounded-xl overflow-hidden" style={{ height: '400px' }}>
+          <div
+            className="mb-8 bg-slate-800 rounded-xl overflow-hidden"
+            // responsive box that keeps 1920×720 (16:9) aspect ratio
+            style={{
+              width: '100%',
+              maxWidth: '1920px',
+              aspectRatio: '16 / 9',
+            }}
+          >
             <GLBViewer file={currentFile} onCameraSave={handleCameraSave} />
           </div>
         )}
@@ -594,7 +598,15 @@ function App() {
                     </div>
                   )}
                   {tilesReceived === totalTiles && totalTiles > 0 && (
+                  <>
                     <span className="text-green-400 font-medium">Complete</span>
+                    <button
+                      onClick={() => exportCanvas()}
+                      className="ml-4 px-3 py-1 rounded bg-cyan-500 text-white text-sm hover:bg-cyan-600"
+                    >
+                      Download PNG
+                    </button>
+                  </>
                   )}
                 </div>
               </div>
