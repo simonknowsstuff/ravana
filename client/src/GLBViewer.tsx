@@ -212,6 +212,41 @@ function SceneContent({ file, onCameraFound, onCameraSave, savedCameraRef, camer
           }
         }
 
+        // Replace all materials with flat, unlit materials
+        gltf.scene.traverse((child) => {
+          if (child instanceof THREE.Mesh) {
+            const originalMaterial = child.material
+            
+            // Create flat material without lighting
+            if (Array.isArray(originalMaterial)) {
+              // Handle multiple materials
+              child.material = originalMaterial.map((mat) => {
+                const color = mat.color || new THREE.Color(0xffffff)
+                return new THREE.MeshBasicMaterial({
+                  color: color,
+                  map: mat.map || null,
+                  transparent: mat.transparent,
+                  opacity: mat.opacity,
+                  side: mat.side,
+                })
+              })
+              // Dispose old materials
+              originalMaterial.forEach((mat) => mat.dispose())
+            } else {
+              // Handle single material
+              const color = originalMaterial.color || new THREE.Color(0xffffff)
+              child.material = new THREE.MeshBasicMaterial({
+                color: color,
+                map: originalMaterial.map || null,
+                transparent: originalMaterial.transparent,
+                opacity: originalMaterial.opacity,
+                side: originalMaterial.side,
+              })
+              originalMaterial.dispose()
+            }
+          }
+        })
+
         setModel(gltf.scene)
         scene.add(gltf.scene)
 
@@ -357,6 +392,12 @@ export default function GLBViewer({ file, onCameraSave }: GLBViewerProps) {
                 position: [5, 5, 5],
               }}
               style={{ background: '#1e293b' }}
+              flat
+              gl={{
+                toneMapping: THREE.ACESFilmicToneMapping,
+                toneMappingExposure: 1,
+                outputColorSpace: THREE.SRGBColorSpace,
+              }}
             >
               <SceneContent
                 file={file}

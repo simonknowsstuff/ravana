@@ -170,7 +170,7 @@ function App() {
   const [savedCameraData, setSavedCameraData] = useState<CameraData | null>(null)
   const [showViewer, setShowViewer] = useState(true)
   const [exposure, setExposure] = useState<number>(0)  // EV compensation: -10 to +10
-  const [lightScale, setLightScale] = useState<number>(1.0)  // Light intensity multiplier
+  const [lightScale, setLightScale] = useState<number>(0.01)  // Light intensity multiplier
   
   // File input ref (to reset after clearing)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -314,7 +314,7 @@ function App() {
     } finally {
       setIsSending(false)
     }
-  }, [glbData, savedCameraData, isConnected])
+  }, [glbData, savedCameraData, isConnected, exposure, lightScale])
 
   const handleFileUpload = useCallback(async (file: File) => {
     if (file && (file.name.endsWith('.gltf') || file.name.endsWith('.glb'))) {
@@ -519,53 +519,65 @@ function App() {
                   </div>
                 </label>
               </div>
-
-              {/* Exposure Control */}
-              <div className="mt-4 bg-slate-800/50 rounded-lg p-4">
-                <label className="block text-white font-medium mb-2">
-                  Exposure: {exposure > 0 ? '+' : ''}{exposure.toFixed(1)} EV
-                </label>
-                <input
-                  type="range"
-                  min="-10"
-                  max="10"
-                  step="0.1"
-                  value={exposure}
-                  onChange={(e) => setExposure(parseFloat(e.target.value))}
-                  className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-purple-500"
-                />
-                <div className="flex justify-between text-xs text-slate-500 mt-1">
-                  <span>-10 EV (darker)</span>
-                  <span>0</span>
-                  <span>+10 EV (brighter)</span>
-                </div>
-                <p className="text-slate-400 text-sm mt-2">Adjust overall brightness (matches Blender's exposure setting)</p>
-              </div>
-
-              {/* Light Intensity Scale */}
-              <div className="mt-4 bg-slate-800/50 rounded-lg p-4">
-                <label className="block text-white font-medium mb-2">
-                  Light Intensity Scale: {lightScale.toFixed(2)}x
-                </label>
-                <input
-                  type="range"
-                  min="0.01"
-                  max="10"
-                  step="0.01"
-                  value={lightScale}
-                  onChange={(e) => setLightScale(parseFloat(e.target.value))}
-                  className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
-                />
-                <div className="flex justify-between text-xs text-slate-500 mt-1">
-                  <span>0.01x (dimmer lights)</span>
-                  <span>1x</span>
-                  <span>10x (brighter lights)</span>
-                </div>
-                <p className="text-slate-400 text-sm mt-2">Fine-tune light power to match Blender exactly (try 0.1x - 0.5x if too bright)</p>
-              </div>
             </>
           )}
         </div>
+
+        {/* Render Settings Section */}
+        {glbData && (
+          <div className="bg-slate-900 rounded-lg p-6 mb-8">
+            <h2 className="text-white font-semibold text-lg mb-4 flex items-center">
+              <svg className="w-5 h-5 mr-2 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" />
+              </svg>
+              Render Settings
+            </h2>
+
+            {/* Exposure Control */}
+            <div className="bg-slate-800/50 rounded-lg p-4 mb-4">
+              <label className="block text-white font-medium mb-2">
+                Exposure: {exposure > 0 ? '+' : ''}{exposure.toFixed(1)} EV
+              </label>
+              <input
+                type="range"
+                min="-10"
+                max="10"
+                step="0.1"
+                value={exposure}
+                onChange={(e) => setExposure(parseFloat(e.target.value))}
+                className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-purple-500"
+              />
+              <div className="flex justify-between text-xs text-slate-500 mt-1">
+                <span>-10 EV (darker)</span>
+                <span>0</span>
+                <span>+10 EV (brighter)</span>
+              </div>
+              <p className="text-slate-400 text-sm mt-2">Adjust overall brightness (matches Blender's exposure setting)</p>
+            </div>
+
+            {/* Light Intensity Scale */}
+            <div className="bg-slate-800/50 rounded-lg p-4">
+              <label className="block text-white font-medium mb-2">
+                Light Intensity Scale: {lightScale.toFixed(3)}x
+              </label>
+              <input
+                type="range"
+                min="0.01"
+                max="1"
+                step="0.001"
+                value={lightScale}
+                onChange={(e) => setLightScale(parseFloat(e.target.value))}
+                className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
+              />
+              <div className="flex justify-between text-xs text-slate-500 mt-1">
+                <span>0.01x (very dim)</span>
+                <span>0.5x</span>
+                <span>1x (full)</span>
+              </div>
+              <p className="text-slate-400 text-sm mt-2">Fine-tune light power from GLTF (start with lower values like 0.01-0.1)</p>
+            </div>
+          </div>
+        )}
 
         {/* 3D Viewer Section */}
         {showViewer && currentFile && (
