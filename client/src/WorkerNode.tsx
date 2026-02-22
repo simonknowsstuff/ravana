@@ -26,9 +26,8 @@ export default function WorkerNode() {
   const pendingTaskRef = useRef<any>(null);
 
   useEffect(() => {
-    workerRef.current = new RaytracerWorker(), { 
-      type: 'module' 
-    };
+  const worker = new RaytracerWorker();
+  workerRef.current = worker;
 
     const serverUrl = import.meta.env.VITE_WS_SERVER_URL || `http://${window.location.hostname}:3000`;
     const socket = io(serverUrl, {
@@ -46,6 +45,17 @@ export default function WorkerNode() {
     socket.on('disconnect', () => {
       setIsConnected(false);
       setStatus('Lost connection to Swarm.');
+      console.warn('[worker-socket] disconnected from server');
+    });
+
+    socket.on('error', (err) => {
+      console.error('[worker-socket] error:', err);
+      setErrorLog(`Socket error: ${err}`);
+    });
+
+    socket.on('connect_error', (err) => {
+      console.error('[worker-socket] connect_error:', err);
+      setErrorLog(`Connection error: ${err}`);
     });
 
     // 3. THE UNPACKER — read pre-merged scene geometry from the binary buffer
@@ -53,7 +63,7 @@ export default function WorkerNode() {
       try {
         setStatus('Unpacking Geometry...');
         const { metadata, buffer } = payload;
-        
+        console.log(`[worker] ✓ received geometry sync (${(buffer.byteLength / 1024 / 1024).toFixed(1)}MB)`);
         // Safety check: Socket.io sometimes wraps binary in a Buffer object
         const rawBuffer = buffer instanceof ArrayBuffer ? buffer : new Uint8Array(buffer).buffer;
         
@@ -84,25 +94,36 @@ export default function WorkerNode() {
         setStatus(`Geometry Cached. (${vertCount} verts, ${triCount} tris, ${nodeCount} BVH nodes)`);
         console.log(`[worker] unpacked merged scene: ${vertCount} verts, ${triCount} tris, ${nodeCount} BVH nodes`);
         
+        // Send geometry to Web Worker immediately (only once!)
+        const renderStartTime = Date.now();
+        workerRef.current?.postMessage({
+          type: 'init_geometry',
+          positions,
+          indices,
+          bvhBuffer,
+          colors,
+          normals,
+          emissive,
+          ao,
+        });
+        console.log(`[worker] sent geometry to Web Worker in ${Date.now() - renderStartTime}ms`);
+
         // RACE CONDITION RESOLVER: Did a task arrive while we were unpacking?
         if (pendingTaskRef.current) {
           setStatus(`Crunching queued tile [${pendingTaskRef.current.startX}, ${pendingTaskRef.current.startY}]...`);
           const queued = pendingTaskRef.current;
-          const msg = {
-            ...queued,
-            positions: geoCacheRef.current.positions,
-            bvhBuffer: geoCacheRef.current.bvhBuffer,
-            indices: geoCacheRef.current.indices,
-            colors: geoCacheRef.current.colors,
-            normals: geoCacheRef.current.normals,
-            emissive: geoCacheRef.current.emissive,
-            ao: geoCacheRef.current.ao,
-            cameraPos: queued.camera?.cameraPos,
-            viewMatrix: queued.camera?.viewMatrix,
-            fov: queued.camera?.fov,
-            sunDir: queued.camera?.sunDir,
-          };
-          workerRef.current?.postMessage(msg);
+          workerRef.current?.postMessage({
+            type: 'render_tile',
+            startX: queued.startX,
+            startY: queued.startY,
+            width: queued.width,
+            height: queued.height,
+            canvasWidth: queued.canvasWidth,
+            canvasHeight: queued.canvasHeight,
+            camera: queued.camera,
+            sunDir: queued.sunDir,
+            lights: queued.lights,
+          });
           pendingTaskRef.current = null;
         }
 
@@ -123,29 +144,32 @@ export default function WorkerNode() {
         return;
       }
 
+      console.log(`[worker] ✓ received task: tile [${task.startX}, ${task.startY}] ${task.width}x${task.height}`);
       setStatus(`Crunching tile [${task.startX}, ${task.startY}]...`);
 
       // flatten camera object so worker has direct access
-      const msg = {
-        ...task,
-        positions: geoCacheRef.current.positions,
-        bvhBuffer: geoCacheRef.current.bvhBuffer,
-        indices: geoCacheRef.current.indices,
-        colors: geoCacheRef.current.colors,
-        normals: geoCacheRef.current.normals,
-        emissive: geoCacheRef.current.emissive,
-        ao: geoCacheRef.current.ao,
-        cameraPos: task.camera?.cameraPos,
-        viewMatrix: task.camera?.viewMatrix,
-        fov: task.camera?.fov,
-        sunDir: task.camera?.sunDir,
-      };
-      workerRef.current?.postMessage(msg);
+      const startTime = Date.now();
+      workerRef.current?.postMessage({
+        type: 'render_tile',
+        startX: task.startX,
+        startY: task.startY,
+        width: task.width,
+        height: task.height,
+        canvasWidth: task.canvasWidth,
+        canvasHeight: task.canvasHeight,
+        camera: task.camera,
+        sunDir: task.sunDir,
+        lights: task.lights,
+      });
+      console.log(`[worker] → posted render job to Web Worker in ${Date.now() - startTime}ms`);
     });
 
     // 5. RECEIVE COMPLETED PIXELS FROM THE WORKER
     workerRef.current.onmessage = (event) => {
       const { buffer, startX, startY, width, height } = event.data;
+      const tileSize = width * height * 4; // RGBA bytes
+      
+      console.log(`[worker-web] ✓ rendered tile [${startX}, ${startY}] ${width}x${height} (${(tileSize / 1024).toFixed(1)}KB)`);
       
       socket.emit('tile_finished', {
         buffer,
@@ -158,6 +182,13 @@ export default function WorkerNode() {
       setTilesProcessed((prev) => prev + 1);
       setStatus('Tile complete. Requesting next...');
     };
+
+    workerRef.current.onerror = (error) => {
+      console.error('[worker-web] CRASHED:', error.message);
+      setErrorLog(`Web Worker crashed: ${error.message}`);
+      setStatus('ERROR: Web Worker crashed');
+    };
+
 
     return () => {
       socket.disconnect();
