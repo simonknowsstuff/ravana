@@ -303,7 +303,15 @@ export async function extractGLBData(
       }
     })
     
-    // No default lights — scenes are dark by default
+    // If the GLB has no lights, add sensible defaults
+    if (lights.length === 0) {
+      console.log('[GLB] No lights found in scene — adding default point lights')
+      lights.push(
+        { type: 'point', position: { x: 3, y: 5, z: 3 }, direction: { x: 0, y: -1, z: 0 }, color: { r: 1, g: 0.95, b: 0.9 }, intensity: 40, distance: 0, decay: 2, angle: 0, penumbra: 0 },
+        { type: 'point', position: { x: -3, y: 4, z: -2 }, direction: { x: 0, y: -1, z: 0 }, color: { r: 0.7, g: 0.8, b: 1.0 }, intensity: 25, distance: 0, decay: 2, angle: 0, penumbra: 0 },
+        { type: 'directional', position: { x: 0, y: 10, z: 0 }, direction: { x: 0.3, y: -1, z: 0.4 }, color: { r: 1, g: 1, b: 1 }, intensity: 1.0, distance: 0, decay: 0, angle: 0, penumbra: 0 },
+      )
+    }
     console.log(`[GLB] extracted ${lights.length} lights:`, lights.map(l => `${l.type}(${l.intensity})`).join(', '))
     
     // Build merged scene geometry: combine all positions + indices, build one BVH
