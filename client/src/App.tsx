@@ -1,5 +1,6 @@
 import { useState, useCallback, useRef, useEffect } from 'react'
 import { io, Socket } from 'socket.io-client'
+import { QRCodeSVG } from 'qrcode.react'
 import GLBViewer, { CameraData } from './GLBViewer'
 import { GLBData, extractGLBData } from './hooks/useGLBData'
 import { useCanvasExporter } from './hooks'
@@ -172,6 +173,7 @@ function App() {
   const [showViewer, setShowViewer] = useState(true)
   const [exposure, setExposure] = useState<number>(0)  // EV compensation: -10 to +10
   const [lightScale, setLightScale] = useState<number>(0.01)  // Light intensity multiplier
+  const [networkIP, setNetworkIP] = useState<string | null>(null)
   
   // Render Settings Modal State
   const [showRenderSettings, setShowRenderSettings] = useState(false)
@@ -225,6 +227,28 @@ function App() {
   }, [imageFormat, jpegQuality])
 
   // Initialize WebSocket connection
+  // Fetch network IP address for QR code
+  useEffect(() => {
+    const serverUrl = import.meta.env.VITE_WS_SERVER_URL || `http://${window.location.hostname}:3000`;
+    console.log('[network-ip] Fetching from:', `${serverUrl}/network-ip`);
+    fetch(`${serverUrl}/network-ip`)
+      .then(res => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      })
+      .then(data => {
+        console.log('[network-ip] Received:', data.ip);
+        console.log('[network-ip] All available IPs:', data.allIPs);
+        console.log('[network-ip] Interfaces:', data.interfaces);
+        setNetworkIP(data.ip);
+      })
+      .catch(err => {
+        console.warn('[network-ip] Failed to fetch network IP, using hostname:', err);
+        // Fallback to current hostname
+        setNetworkIP(window.location.hostname);
+      });
+  }, []);
+
   useEffect(() => {
     const serverUrl = import.meta.env.VITE_WS_SERVER_URL || `http://${window.location.hostname}:3000`;
     const socket = io(serverUrl,{
@@ -449,13 +473,42 @@ function App() {
       <div className="flex-1 flex flex-col">
         {/* Header */}
         <header className="p-6 border-b border-white/10 bg-slate-800 relative z-10">
-        <h1 className="text-4xl font-bold text-white text-center">
-          Ravana
-        </h1>
-        <p className="text-slate-400 text-center mt-2">
-          Zero-install, browser-based compute farm.
-        </p>
-      </header>
+          <div className="max-w-7xl mx-auto">
+            <div className="flex items-center justify-between">
+              <div className="flex-1">
+                <h1 className="text-4xl font-bold text-white">
+                  Ravana
+                </h1>
+                <p className="text-slate-400 mt-2">
+                  Zero-install, browser-based compute farm.
+                </p>
+              </div>
+              
+              {/* QR Code Section */}
+              {networkIP && (
+                <div className="ml-8 bg-slate-700/50 rounded-lg p-4 flex items-center space-x-4">
+                  <div className="bg-white p-2 rounded-lg">
+                    <QRCodeSVG 
+                      value={`http://${networkIP}:${window.location.port || '5173'}/worker`}
+                      size={120}
+                      level="M"
+                      includeMargin={false}
+                    />
+                  </div>
+                  <div className="text-left">
+                    <p className="text-sm font-semibold text-white mb-1">Join as Worker</p>
+                    <p className="text-xs text-slate-400 max-w-[200px]">
+                      Scan to connect your device as a render node
+                    </p>
+                    <p className="text-xs text-purple-400 mt-2 font-mono break-all">
+                      http://{networkIP}:{window.location.port || '5173'}/worker
+                    </p>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </header>
 
         <main className="container mx-auto p-6 pb-30 relative z-10 flex-1">
         {/* Upload Section */}

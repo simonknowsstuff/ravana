@@ -7,6 +7,11 @@ import './index.css'
 // Check the URL bar of whoever is connecting
 const currentPath = window.location.pathname;
 
+// Redirect to root if path is not /worker or /
+if (currentPath !== '/' && currentPath !== '/worker') {
+  window.history.replaceState({}, '', '/');
+}
+
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     {/* The Traffic Switch */}
