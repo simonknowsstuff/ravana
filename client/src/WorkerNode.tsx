@@ -42,9 +42,9 @@ export default function WorkerNode() {
       return;
     }
 
-    const { startX, startY, width, height, canvasWidth, canvasHeight, camera: cameraData } = task;
+    const { startX, startY, width, height, canvasWidth, canvasHeight, camera: cameraData, samples: taskSamples } = task;
     
-    console.log(`[Render] Tile [${startX},${startY}] ${width}x${height} of ${canvasWidth}x${canvasHeight}`);
+    console.log(`[Render] Tile [${startX},${startY}] ${width}x${height} of ${canvasWidth}x${canvasHeight} with ${taskSamples || 16} samples`);
     
     // Update camera from task data - use FULL canvas aspect ratio
     if (cameraData) {
@@ -149,8 +149,8 @@ export default function WorkerNode() {
     pathtracerRef.current.setScene(sceneRef.current, cameraRef.current);
     pathtracerRef.current.reset();
     
-    // Render samples - increased for maximum quality
-    const samples = 16; // Higher samples = better quality, shadows, and lighting
+    // Render samples - use value from task or default to 16
+    const samples = taskSamples || 16;
     for (let i = 0; i < samples; i++) {
       pathtracerRef.current.renderSample();
     }
