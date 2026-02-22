@@ -170,6 +170,15 @@ function App() {
   const [currentFile, setCurrentFile] = useState<File | null>(null)
   const [savedCameraData, setSavedCameraData] = useState<CameraData | null>(null)
   const [showViewer, setShowViewer] = useState(true)
+  const [exposure, setExposure] = useState<number>(0)  // EV compensation: -10 to +10
+  const [lightScale, setLightScale] = useState<number>(0.01)  // Light intensity multiplier
+  
+  // Render Settings Modal State
+  const [showRenderSettings, setShowRenderSettings] = useState(false)
+  const [renderWidth, setRenderWidth] = useState<number>(1920)
+  const [renderHeight, setRenderHeight] = useState<number>(1080)
+  const [samples, setSamples] = useState<number>(16)
+  const [tileSize, setTileSize] = useState<number>(64)
   
   // File input ref (to reset after clearing)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -188,10 +197,32 @@ function App() {
   const [totalTiles, setTotalTiles] = useState(0)
   const [renderStartTime, setRenderStartTime] = useState<number | null>(null)
   const [renderElapsed, setRenderElapsed] = useState<string>('')
+  const [imageFormat, setImageFormat] = useState<'png' | 'jpeg'>('png')
+  const [jpegQuality, setJpegQuality] = useState<number>(0.95)
 
-  // fixed resolution for all renders
-  const RENDER_WIDTH = 1280
-  const RENDER_HEIGHT = 720
+  // Download rendered image
+  const handleDownloadImage = useCallback(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+
+    const mimeType = imageFormat === 'png' ? 'image/png' : 'image/jpeg'
+    const quality = imageFormat === 'jpeg' ? jpegQuality : undefined
+    
+    canvas.toBlob((blob) => {
+      if (!blob) {
+        console.error('Failed to create blob from canvas')
+        return
+      }
+      
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      const timestamp = new Date().toISOString().replace(/:/g, '-').split('.')[0]
+      link.download = `ravana-render-${timestamp}.${imageFormat}`
+      link.href = url
+      link.click()
+      URL.revokeObjectURL(url)
+    }, mimeType, quality)
+  }, [imageFormat, jpegQuality])
 
   // Initialize WebSocket connection
   useEffect(() => {
@@ -249,11 +280,18 @@ function App() {
     }
   }, [])
 
-  // Compile and send scene data to workers
+  // Open render settings modal
+  const handleOpenRenderSettings = useCallback(() => {
+    setShowRenderSettings(true)
+  }, [])
+
+  // Compile and send scene data to workers with render settings
   const handleSendToWorkers = useCallback(() => {
     if (!glbData || !socketRef.current || !isConnected) return
 
     setIsSending(true)
+    setShowRenderSettings(false) // Close modal
+    
     try {
       const { metadata, buffer } = compileSceneData(glbData, savedCameraData)
       
@@ -265,9 +303,8 @@ function App() {
       })
 
       // 2. THE SPARK: Tell the server to create the queue and start the Swarm
-      const tileSize = 64
-      const cols = Math.ceil(RENDER_WIDTH / tileSize)
-      const rows = Math.ceil(RENDER_HEIGHT / tileSize)
+      const cols = Math.ceil(renderWidth / tileSize)
+      const rows = Math.ceil(renderHeight / tileSize)
       setTotalTiles(cols * rows)
       setTilesReceived(0)
       setIsRendering(true)
@@ -276,21 +313,28 @@ function App() {
       // Initialize canvas to black
       const canvas = canvasRef.current
       if (canvas) {
+        canvas.width = renderWidth
+        canvas.height = renderHeight
         const ctx = canvas.getContext('2d')
         if (ctx) {
           ctx.fillStyle = '#0f0f19'
-          ctx.fillRect(0, 0, RENDER_WIDTH, RENDER_HEIGHT)
+          ctx.fillRect(0, 0, renderWidth, renderHeight)
         }
       }
 
       socketRef.current.emit('start_render', {
-        canvasWidth: RENDER_WIDTH,
-        canvasHeight: RENDER_HEIGHT,
+        canvasWidth: renderWidth,
+        canvasHeight: renderHeight,
+        samples: samples,
+        tileSize: tileSize,
         camera: {
           cameraPos: savedCameraData?.position ?? { x: 0, y: 2, z: 5 },
           viewMatrix: savedCameraData?.cameraMatrix || [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1],
           fov: savedCameraData?.fov ?? 50,
           sunDir: { x: 0.5, y: 1.0, z: 0.5 },
+          exposure: exposure,  // EV compensation
+          lightScale: lightScale,  // Light intensity multiplier
+          samples: samples,  // Samples per pixel
         },
         lights: glbData.lights,
         sunDir: { x: 0.5, y: 1.0, z: 0.5 }
@@ -299,12 +343,13 @@ function App() {
       setLastSentPayload(metadata)
       console.log('[socket] sent scene payload:', metadata)
       console.log('[socket] binary buffer size:', buffer.byteLength, 'bytes')
+      console.log('[socket] render settings:', { renderWidth, renderHeight, samples, tileSize, exposure, lightScale })
     } catch (error) {
       console.error('[socket] failed to send:', error)
     } finally {
       setIsSending(false)
     }
-  }, [glbData, savedCameraData, isConnected])
+  }, [glbData, savedCameraData, isConnected, exposure, lightScale, renderWidth, renderHeight, samples, tileSize])
 
   const handleFileUpload = useCallback(async (file: File) => {
     if (file && (file.name.endsWith('.gltf') || file.name.endsWith('.glb'))) {
@@ -494,24 +539,80 @@ function App() {
 
           {/* 3D Viewer Toggle */}
           {fileName && (
-            <div className="mt-4 flex items-center space-x-3 bg-slate-800/50 rounded-lg p-4">
-              <label className="flex items-center space-x-3 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={showViewer}
-                  onChange={(e) => setShowViewer(e.target.checked)}
-                  className="w-5 h-5 rounded border-slate-600 bg-slate-700 text-purple-500 focus:ring-purple-500 focus:ring-offset-slate-900"
-                />
-                <div>
-                  <span className="text-white font-medium">Show 3D Viewer</span>
-                  <p className="text-slate-400 text-sm">
-                    Low quality preview (maintains 8:3 aspect ratio)
-                  </p>
-                </div>
-              </label>
-            </div>
+            <>
+              <div className="mt-4 flex items-center space-x-3 bg-slate-800/50 rounded-lg p-4">
+                <label className="flex items-center space-x-3 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={showViewer}
+                    onChange={(e) => setShowViewer(e.target.checked)}
+                    className="w-5 h-5 rounded border-slate-600 bg-slate-700 text-purple-500 focus:ring-purple-500 focus:ring-offset-slate-900"
+                  />
+                  <div>
+                    <span className="text-white font-medium">Show 3D Viewer</span>
+                    <p className="text-slate-400 text-sm">Low quality preview with camera detection</p>
+                  </div>
+                </label>
+              </div>
+            </>
           )}
         </div>
+
+        {/* Render Settings Section */}
+        {glbData && (
+          <div className="bg-slate-900 rounded-lg p-6 mb-8">
+            <h2 className="text-white font-semibold text-lg mb-4 flex items-center">
+              <svg className="w-5 h-5 mr-2 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" />
+              </svg>
+              Render Settings
+            </h2>
+
+            {/* Exposure Control */}
+            <div className="bg-slate-800/50 rounded-lg p-4 mb-4">
+              <label className="block text-white font-medium mb-2">
+                Exposure: {exposure > 0 ? '+' : ''}{exposure.toFixed(1)} EV
+              </label>
+              <input
+                type="range"
+                min="-10"
+                max="10"
+                step="0.1"
+                value={exposure}
+                onChange={(e) => setExposure(parseFloat(e.target.value))}
+                className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-purple-500"
+              />
+              <div className="flex justify-between text-xs text-slate-500 mt-1">
+                <span>-10 EV (darker)</span>
+                <span>0</span>
+                <span>+10 EV (brighter)</span>
+              </div>
+              <p className="text-slate-400 text-sm mt-2">Adjust overall brightness (matches Blender's exposure setting)</p>
+            </div>
+
+            {/* Light Intensity Scale */}
+            <div className="bg-slate-800/50 rounded-lg p-4">
+              <label className="block text-white font-medium mb-2">
+                Light Intensity Scale: {lightScale.toFixed(3)}x
+              </label>
+              <input
+                type="range"
+                min="0.01"
+                max="1"
+                step="0.001"
+                value={lightScale}
+                onChange={(e) => setLightScale(parseFloat(e.target.value))}
+                className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
+              />
+              <div className="flex justify-between text-xs text-slate-500 mt-1">
+                <span>0.01x (very dim)</span>
+                <span>0.5x</span>
+                <span>1x (full)</span>
+              </div>
+              <p className="text-slate-400 text-sm mt-2">Fine-tune light power from GLTF (start with lower values like 0.01-0.1)</p>
+            </div>
+          </div>
+        )}
 
         {/* 3D Viewer Section */}
         {showViewer && currentFile && (
@@ -610,13 +711,77 @@ function App() {
                   )}
                 </div>
               </div>
-              <div className="flex justify-center p-4 bg-slate-900/50">
+              
+              {/* Save Controls - Show when render is complete */}
+              {tilesReceived === totalTiles && totalTiles > 0 && (
+                <div className="px-6 py-4 bg-slate-800/50 border-b border-slate-700">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center space-x-4">
+                      <span className="text-sm font-medium text-white">Save as:</span>
+                      <div className="flex items-center space-x-2">
+                        <button
+                          onClick={() => setImageFormat('png')}
+                          className={`px-4 py-2 rounded-lg text-sm font-medium transition-all ${
+                            imageFormat === 'png'
+                              ? 'bg-cyan-500 text-white'
+                              : 'bg-slate-700 text-slate-300 hover:bg-slate-600'
+                          }`}
+                        >
+                          PNG
+                        </button>
+                        <button
+                          onClick={() => setImageFormat('jpeg')}
+                          className={`px-4 py-2 rounded-lg text-sm font-medium transition-all ${
+                            imageFormat === 'jpeg'
+                              ? 'bg-cyan-500 text-white'
+                              : 'bg-slate-700 text-slate-300 hover:bg-slate-600'
+                          }`}
+                        >
+                          JPEG
+                        </button>
+                      </div>
+                      {imageFormat === 'jpeg' && (
+                        <div className="flex items-center space-x-2">
+                          <span className="text-sm text-slate-400">Quality:</span>
+                          <input
+                            type="range"
+                            min="0.5"
+                            max="1"
+                            step="0.05"
+                            value={jpegQuality}
+                            onChange={(e) => setJpegQuality(parseFloat(e.target.value))}
+                            className="w-24 h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
+                          />
+                          <span className="text-sm text-slate-300 font-mono w-10">{(jpegQuality * 100).toFixed(0)}%</span>
+                        </div>
+                      )}
+                    </div>
+                    <button
+                      onClick={handleDownloadImage}
+                      className="px-6 py-2 bg-gradient-to-r from-green-500 to-emerald-500 hover:from-green-400 hover:to-emerald-400 text-white font-semibold rounded-lg transition-all duration-300 flex items-center space-x-2 shadow-lg shadow-green-500/20"
+                    >
+                      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                      </svg>
+                      <span>Download Image</span>
+                    </button>
+                  </div>
+                </div>
+              )}
+              <div className="flex justify-center p-4 bg-slate-900/50" style={{ maxHeight: '1000px', overflow: 'auto' }}>
                 <canvas
                   ref={canvasRef}
-                  width={RENDER_WIDTH}
-                  height={RENDER_HEIGHT}
+                  width={renderWidth}
+                  height={renderHeight}
                   className="rounded-lg border border-slate-700 shadow-lg shadow-cyan-500/10"
-                  style={{ maxWidth: '100%', height: 'auto', imageRendering: 'pixelated' }}
+                  style={{ 
+                    maxWidth: '100%', 
+                    maxHeight: '950px',
+                    width: 'auto',
+                    height: 'auto',
+                    objectFit: 'contain',
+                    imageRendering: 'pixelated' 
+                  }}
                 />
               </div>
             </div>
@@ -764,7 +929,7 @@ function App() {
                 </div>
                 {/* Button */}
                 <button
-                  onClick={handleSendToWorkers}
+                  onClick={handleOpenRenderSettings}
                   disabled={!isConnected || isSending}
                   className={`px-8 py-3 rounded-xl font-semibold text-lg transition-all duration-300 flex items-center space-x-3 ${
                     isConnected && !isSending
@@ -785,6 +950,199 @@ function App() {
                       <span>Send to Workers</span>
                     </>
                   )}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Render Settings Modal */}
+        {showRenderSettings && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
+            <div className="bg-slate-800 rounded-2xl p-8 max-w-2xl w-full mx-4 shadow-2xl border border-cyan-500/30">
+              {/* Modal Header */}
+              <div className="flex items-center justify-between mb-6">
+                <h2 className="text-2xl font-bold text-white">Render Settings</h2>
+                <button
+                  onClick={() => setShowRenderSettings(false)}
+                  className="text-slate-400 hover:text-white transition-colors"
+                >
+                  <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
+
+              {/* Settings Grid */}
+              <div className="space-y-6">
+                {/* Resolution Section */}
+                <div>
+                  <h3 className="text-lg font-semibold text-cyan-400 mb-4">Resolution</h3>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-sm font-medium text-slate-300 mb-2">Width</label>
+                      <input
+                        type="number"
+                        value={renderWidth}
+                        onChange={(e) => setRenderWidth(Math.max(128, parseInt(e.target.value) || 1920))}
+                        className="w-full px-4 py-2 bg-slate-700 text-white rounded-lg focus:outline-none focus:ring-2 focus:ring-cyan-500"
+                        min="128"
+                        max="7680"
+                        step="16"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-slate-300 mb-2">Height</label>
+                      <input
+                        type="number"
+                        value={renderHeight}
+                        onChange={(e) => setRenderHeight(Math.max(128, parseInt(e.target.value) || 1080))}
+                        className="w-full px-4 py-2 bg-slate-700 text-white rounded-lg focus:outline-none focus:ring-2 focus:ring-cyan-500"
+                        min="128"
+                        max="4320"
+                        step="16"
+                      />
+                    </div>
+                  </div>
+                  <div className="flex gap-2 mt-3">
+                    <button onClick={() => { setRenderWidth(1920); setRenderHeight(1080); }} className="px-3 py-1 text-xs bg-slate-600 hover:bg-slate-500 text-white rounded transition-colors">1080p</button>
+                    <button onClick={() => { setRenderWidth(2560); setRenderHeight(1440); }} className="px-3 py-1 text-xs bg-slate-600 hover:bg-slate-500 text-white rounded transition-colors">1440p</button>
+                    <button onClick={() => { setRenderWidth(3840); setRenderHeight(2160); }} className="px-3 py-1 text-xs bg-slate-600 hover:bg-slate-500 text-white rounded transition-colors">4K</button>
+                  </div>
+                </div>
+
+                {/* Lighting Section */}
+                <div>
+                  <h3 className="text-lg font-semibold text-cyan-400 mb-4">Lighting</h3>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-sm font-medium text-slate-300 mb-2">
+                        Exposure (EV): {exposure.toFixed(2)}
+                      </label>
+                      <input
+                        type="range"
+                        value={exposure}
+                        onChange={(e) => setExposure(parseFloat(e.target.value))}
+                        className="w-full"
+                        min="-10"
+                        max="10"
+                        step="0.1"
+                      />
+                      <div className="flex justify-between text-xs text-slate-500 mt-1">
+                        <span>-10</span>
+                        <span>0</span>
+                        <span>+10</span>
+                      </div>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-slate-300 mb-2">
+                        Light Scale: {lightScale.toFixed(3)}
+                      </label>
+                      <input
+                        type="range"
+                        value={lightScale}
+                        onChange={(e) => setLightScale(parseFloat(e.target.value))}
+                        className="w-full"
+                        min="0.001"
+                        max="10"
+                        step="0.001"
+                      />
+                      <div className="flex justify-between text-xs text-slate-500 mt-1">
+                        <span>0.001</span>
+                        <span>1.0</span>
+                        <span>10</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Quality Settings */}
+                <div>
+                  <h3 className="text-lg font-semibold text-cyan-400 mb-4">Quality</h3>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-sm font-medium text-slate-300 mb-2">
+                        Samples per Pixel: {samples}
+                      </label>
+                      <input
+                        type="range"
+                        value={samples}
+                        onChange={(e) => setSamples(parseInt(e.target.value))}
+                        className="w-full"
+                        min="1"
+                        max="128"
+                        step="1"
+                      />
+                      <div className="flex justify-between text-xs text-slate-500 mt-1">
+                        <span>1 (Fast)</span>
+                        <span>64</span>
+                        <span>128 (Best)</span>
+                      </div>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-slate-300 mb-2">
+                        Tile Size: {tileSize}px
+                      </label>
+                      <input
+                        type="range"
+                        value={tileSize}
+                        onChange={(e) => setTileSize(parseInt(e.target.value))}
+                        className="w-full"
+                        min="32"
+                        max="256"
+                        step="32"
+                      />
+                      <div className="flex justify-between text-xs text-slate-500 mt-1">
+                        <span>32</span>
+                        <span>128</span>
+                        <span>256</span>
+                      </div>
+                    </div>
+                  </div>
+                  <p className="text-xs text-slate-500 mt-3">
+                    Higher samples = better quality but slower render. Smaller tiles = better distribution but more overhead.
+                  </p>
+                </div>
+
+                {/* Render Info */}
+                <div className="bg-slate-700/50 rounded-lg p-4">
+                  <div className="grid grid-cols-2 gap-4 text-sm">
+                    <div>
+                      <span className="text-slate-400">Total Pixels:</span>
+                      <span className="text-white ml-2">{(renderWidth * renderHeight).toLocaleString()}</span>
+                    </div>
+                    <div>
+                      <span className="text-slate-400">Total Tiles:</span>
+                      <span className="text-white ml-2">{Math.ceil(renderWidth / tileSize) * Math.ceil(renderHeight / tileSize)}</span>
+                    </div>
+                    <div>
+                      <span className="text-slate-400">Aspect Ratio:</span>
+                      <span className="text-white ml-2">{(renderWidth / renderHeight).toFixed(3)}</span>
+                    </div>
+                    <div>
+                      <span className="text-slate-400">Total Samples:</span>
+                      <span className="text-white ml-2">{(renderWidth * renderHeight * samples).toLocaleString()}</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Action Buttons */}
+              <div className="flex justify-end gap-4 mt-8">
+                <button
+                  onClick={() => setShowRenderSettings(false)}
+                  className="px-6 py-3 rounded-lg font-semibold text-slate-300 bg-slate-700 hover:bg-slate-600 transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleSendToWorkers}
+                  className="px-6 py-3 rounded-lg font-semibold text-white bg-cyan-500 hover:bg-cyan-400 transition-colors flex items-center space-x-2"
+                >
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                  </svg>
+                  <span>Start Render</span>
                 </button>
               </div>
             </div>
