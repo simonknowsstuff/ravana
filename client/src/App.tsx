@@ -6,11 +6,14 @@ import { useCanvasExporter } from './hooks'
 import { ScenePayload } from './types'
 
 // Compile scene data into a binary buffer for efficient transmission
+// App.tsx
+// Compile scene data into a binary buffer for efficient transmission
+// Compile scene data into a binary buffer for efficient transmission
 function compileSceneData(glbData: GLBData, cameraData: CameraData | null): { metadata: ScenePayload; buffer: ArrayBuffer } {
-  // Calculate total buffer size needed for per-mesh data
   let totalBytes = 0
   const meshOffsets: ScenePayload['geometry']['meshes'] = []
   
+  // 1. Calculate per-mesh bytes (unchanged)
   for (const mesh of glbData.meshes) {
     const positionsLength = mesh.positions.byteLength
     const normalsLength = mesh.normals?.byteLength ?? 0
@@ -28,26 +31,20 @@ function compileSceneData(glbData: GLBData, cameraData: CameraData | null): { me
       hasUvs: !!mesh.uvs,
       hasBakedData: !!mesh.bakedData,
       hasBvhData: !!mesh.bvhData,
-      positionsOffset: totalBytes,
-      positionsLength,
-      normalsOffset: totalBytes + positionsLength,
-      normalsLength,
-      uvsOffset: totalBytes + positionsLength + normalsLength,
-      uvsLength,
-      indicesOffset: totalBytes + positionsLength + normalsLength + uvsLength,
-      indicesLength,
-      aoOffset: totalBytes + positionsLength + normalsLength + uvsLength + indicesLength,
-      aoLength,
-      vertexColorsOffset: totalBytes + positionsLength + normalsLength + uvsLength + indicesLength + aoLength,
-      vertexColorsLength,
-      bvhOffset: totalBytes + positionsLength + normalsLength + uvsLength + indicesLength + aoLength + vertexColorsLength,
-      bvhLength,
+      positionsOffset: totalBytes, positionsLength,
+      normalsOffset: totalBytes + positionsLength, normalsLength,
+      uvsOffset: totalBytes + positionsLength + normalsLength, uvsLength,
+      indicesOffset: totalBytes + positionsLength + normalsLength + uvsLength, indicesLength,
+      aoOffset: totalBytes + positionsLength + normalsLength + uvsLength + indicesLength, aoLength,
+      vertexColorsOffset: totalBytes + positionsLength + normalsLength + uvsLength + indicesLength + aoLength, vertexColorsLength,
+      bvhOffset: totalBytes + positionsLength + normalsLength + uvsLength + indicesLength + aoLength + vertexColorsLength, bvhLength,
     })
     
     totalBytes += positionsLength + normalsLength + uvsLength + indicesLength + aoLength + vertexColorsLength + bvhLength
   }
   
-  // Merged scene data offsets (appended after per-mesh data)
+  // 2. Calculate Merged Scene offsets
+  // @ts-ignore - bypassing strict type checking if TS hasn't caught up with GLBData updates yet
   const merged = glbData.merged
   const mergedPosOff = totalBytes
   const mergedIdxOff = mergedPosOff + merged.positions.byteLength
@@ -56,84 +53,96 @@ function compileSceneData(glbData: GLBData, cameraData: CameraData | null): { me
   const mergedNrmOff = mergedColOff + merged.colors.byteLength
   const mergedEmiOff = mergedNrmOff + merged.normals.byteLength
   const mergedAoOff = mergedEmiOff + merged.emissive.byteLength
-  const mergedMeta = {
-    positionsOffset: mergedPosOff,
-    positionsLength: merged.positions.byteLength,
-    indicesOffset: mergedIdxOff,
-    indicesLength: merged.indices.byteLength,
-    bvhOffset: mergedBvhOff,
-    bvhLength: merged.bvhData.byteLength,
-    colorsOffset: mergedColOff,
-    colorsLength: merged.colors.byteLength,
-    normalsOffset: mergedNrmOff,
-    normalsLength: merged.normals.byteLength,
-    emissiveOffset: mergedEmiOff,
-    emissiveLength: merged.emissive.byteLength,
-    aoOffset: mergedAoOff,
-    aoLength: merged.ambientOcclusion.byteLength,
-  }
-  totalBytes += merged.positions.byteLength + merged.indices.byteLength + merged.bvhData.byteLength + merged.colors.byteLength + merged.normals.byteLength + merged.emissive.byteLength + merged.ambientOcclusion.byteLength
   
-  // Create the binary buffer
+  // ── Texture Mapping Offsets ──
+  const mergedUvOff = mergedAoOff + merged.ambientOcclusion.byteLength
+  const mergedTexIdxOff = mergedUvOff + merged.uvs.byteLength
+  
+  // ── NEW: PBR Mapping Offsets ──
+  const mergedRoughOff = mergedTexIdxOff + merged.textureIndices.byteLength
+  const mergedMetalOff = mergedRoughOff + merged.roughness.byteLength
+  const mergedOrmIdxOff = mergedMetalOff + merged.metallic.byteLength
+
+  const mergedEmiTexIdxOff = mergedOrmIdxOff + merged.ormTextureIndices.byteLength;
+  let currentTexOffset = mergedEmiTexIdxOff + merged.emissiveTextureIndices.byteLength;
+  
+  const textureMeta = (merged.textures || []).map((tex: any) => {
+    const meta = {
+      width: tex.width,
+      height: tex.height,
+      pixelsOffset: currentTexOffset,
+      pixelsLength: tex.pixels.byteLength
+    }
+    currentTexOffset += tex.pixels.byteLength
+    return meta
+  })
+
+  // ── This is the object TypeScript was yelling about ──
+  const mergedMeta = {
+    positionsOffset: mergedPosOff, positionsLength: merged.positions.byteLength,
+    indicesOffset: mergedIdxOff, indicesLength: merged.indices.byteLength,
+    bvhOffset: mergedBvhOff, bvhLength: merged.bvhData.byteLength,
+    colorsOffset: mergedColOff, colorsLength: merged.colors.byteLength,
+    normalsOffset: mergedNrmOff, normalsLength: merged.normals.byteLength,
+    emissiveOffset: mergedEmiOff, emissiveLength: merged.emissive.byteLength,
+    aoOffset: mergedAoOff, aoLength: merged.ambientOcclusion.byteLength,
+    uvsOffset: mergedUvOff, uvsLength: merged.uvs.byteLength,
+    textureIndicesOffset: mergedTexIdxOff, textureIndicesLength: merged.textureIndices.byteLength,
+    // ── NEW: Add the PBR lengths and offsets here ──
+    roughnessOffset: mergedRoughOff, roughnessLength: merged.roughness.byteLength,
+    metallicOffset: mergedMetalOff, metallicLength: merged.metallic.byteLength,
+    ormTextureIndicesOffset: mergedOrmIdxOff, ormTextureIndicesLength: merged.ormTextureIndices.byteLength,
+    textures: textureMeta,
+    emissiveTextureIndicesOffset: mergedEmiTexIdxOff, 
+    emissiveTextureIndicesLength: merged.emissiveTextureIndices.byteLength,
+  }
+  
+  // The final total size is exactly where the last texture pixel array ends
+  totalBytes = currentTexOffset
+  
+  // 3. Create the binary buffer
   const buffer = new ArrayBuffer(totalBytes)
   const view = new Uint8Array(buffer)
   
+  // 4. Copy per-mesh data
   let offset = 0
   for (const mesh of glbData.meshes) {
-    // Copy positions
-    view.set(new Uint8Array(mesh.positions.buffer, mesh.positions.byteOffset, mesh.positions.byteLength), offset)
-    offset += mesh.positions.byteLength
-    
-    // Copy normals
-    if (mesh.normals) {
-      view.set(new Uint8Array(mesh.normals.buffer, mesh.normals.byteOffset, mesh.normals.byteLength), offset)
-      offset += mesh.normals.byteLength
-    }
-    
-    // Copy UVs
-    if (mesh.uvs) {
-      view.set(new Uint8Array(mesh.uvs.buffer, mesh.uvs.byteOffset, mesh.uvs.byteLength), offset)
-      offset += mesh.uvs.byteLength
-    }
-    
-    // Copy indices
-    if (mesh.indices) {
-      view.set(new Uint8Array(mesh.indices.buffer, mesh.indices.byteOffset, mesh.indices.byteLength), offset)
-      offset += mesh.indices.byteLength
-    }
-    
-    // Copy baked data
+    view.set(new Uint8Array(mesh.positions.buffer, mesh.positions.byteOffset, mesh.positions.byteLength), offset); offset += mesh.positions.byteLength
+    if (mesh.normals) { view.set(new Uint8Array(mesh.normals.buffer, mesh.normals.byteOffset, mesh.normals.byteLength), offset); offset += mesh.normals.byteLength }
+    if (mesh.uvs) { view.set(new Uint8Array(mesh.uvs.buffer, mesh.uvs.byteOffset, mesh.uvs.byteLength), offset); offset += mesh.uvs.byteLength }
+    if (mesh.indices) { view.set(new Uint8Array(mesh.indices.buffer, mesh.indices.byteOffset, mesh.indices.byteLength), offset); offset += mesh.indices.byteLength }
     if (mesh.bakedData) {
-      const ao = mesh.bakedData.ambientOcclusion
-      view.set(new Uint8Array(ao.buffer, ao.byteOffset, ao.byteLength), offset)
-      offset += ao.byteLength
-      const vc = mesh.bakedData.vertexColors
-      view.set(new Uint8Array(vc.buffer, vc.byteOffset, vc.byteLength), offset)
-      offset += vc.byteLength
+      const ao = mesh.bakedData.ambientOcclusion; view.set(new Uint8Array(ao.buffer, ao.byteOffset, ao.byteLength), offset); offset += ao.byteLength
+      const vc = mesh.bakedData.vertexColors; view.set(new Uint8Array(vc.buffer, vc.byteOffset, vc.byteLength), offset); offset += vc.byteLength
     }
-    
-    // Copy BVH data
-    if (mesh.bvhData) {
-      view.set(new Uint8Array(mesh.bvhData.buffer, mesh.bvhData.byteOffset, mesh.bvhData.byteLength), offset)
-      offset += mesh.bvhData.byteLength
-    }
+    if (mesh.bvhData) { view.set(new Uint8Array(mesh.bvhData.buffer, mesh.bvhData.byteOffset, mesh.bvhData.byteLength), offset); offset += mesh.bvhData.byteLength }
   }
   
-  // Copy merged scene data
-  view.set(new Uint8Array(merged.positions.buffer, merged.positions.byteOffset, merged.positions.byteLength), offset)
-  offset += merged.positions.byteLength
-  view.set(new Uint8Array(merged.indices.buffer, merged.indices.byteOffset, merged.indices.byteLength), offset)
-  offset += merged.indices.byteLength
-  view.set(new Uint8Array(merged.bvhData.buffer, merged.bvhData.byteOffset, merged.bvhData.byteLength), offset)
-  offset += merged.bvhData.byteLength
-  view.set(new Uint8Array(merged.colors.buffer, merged.colors.byteOffset, merged.colors.byteLength), offset)
-  offset += merged.colors.byteLength
-  view.set(new Uint8Array(merged.normals.buffer, merged.normals.byteOffset, merged.normals.byteLength), offset)
-  offset += merged.normals.byteLength
-  view.set(new Uint8Array(merged.emissive.buffer, merged.emissive.byteOffset, merged.emissive.byteLength), offset)
-  offset += merged.emissive.byteLength
-  view.set(new Uint8Array(merged.ambientOcclusion.buffer, merged.ambientOcclusion.byteOffset, merged.ambientOcclusion.byteLength), offset)
-  offset += merged.ambientOcclusion.byteLength
+  // 5. Copy merged scene data
+  view.set(new Uint8Array(merged.positions.buffer, merged.positions.byteOffset, merged.positions.byteLength), mergedPosOff)
+  view.set(new Uint8Array(merged.indices.buffer, merged.indices.byteOffset, merged.indices.byteLength), mergedIdxOff)
+  view.set(new Uint8Array(merged.bvhData.buffer, merged.bvhData.byteOffset, merged.bvhData.byteLength), mergedBvhOff)
+  view.set(new Uint8Array(merged.colors.buffer, merged.colors.byteOffset, merged.colors.byteLength), mergedColOff)
+  view.set(new Uint8Array(merged.normals.buffer, merged.normals.byteOffset, merged.normals.byteLength), mergedNrmOff)
+  view.set(new Uint8Array(merged.emissive.buffer, merged.emissive.byteOffset, merged.emissive.byteLength), mergedEmiOff)
+  view.set(new Uint8Array(merged.ambientOcclusion.buffer, merged.ambientOcclusion.byteOffset, merged.ambientOcclusion.byteLength), mergedAoOff)
+  
+  // ── Copy UVs, Texture Indices, and PBR properties ──
+  view.set(new Uint8Array(merged.uvs.buffer, merged.uvs.byteOffset, merged.uvs.byteLength), mergedUvOff)
+  view.set(new Uint8Array(merged.textureIndices.buffer, merged.textureIndices.byteOffset, merged.textureIndices.byteLength), mergedTexIdxOff)
+  
+  // ── NEW: Write the actual PBR float arrays into the buffer ──
+  view.set(new Uint8Array(merged.roughness.buffer, merged.roughness.byteOffset, merged.roughness.byteLength), mergedRoughOff)
+  view.set(new Uint8Array(merged.metallic.buffer, merged.metallic.byteOffset, merged.metallic.byteLength), mergedMetalOff)
+  view.set(new Uint8Array(merged.ormTextureIndices.buffer, merged.ormTextureIndices.byteOffset, merged.ormTextureIndices.byteLength), mergedOrmIdxOff)
+  view.set(new Uint8Array(merged.emissiveTextureIndices.buffer, merged.emissiveTextureIndices.byteOffset, merged.emissiveTextureIndices.byteLength), mergedEmiTexIdxOff)
+  if (merged.textures) {
+    for (let i = 0; i < merged.textures.length; i++) {
+      const tex = merged.textures[i]
+      const meta = textureMeta[i]
+      view.set(new Uint8Array(tex.pixels.buffer, tex.pixels.byteOffset, tex.pixels.byteLength), meta.pixelsOffset)
+    }
+  }
   
   const metadata: ScenePayload = {
     timestamp: Date.now(),

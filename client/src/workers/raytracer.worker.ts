@@ -1,5 +1,5 @@
 /**
- * SHARD NODE WORKER — Multi-light raytracer with point/directional/spot support
+ * SHARD NODE WORKER — Multi-light raytracer with PBR (Metallic/Roughness) & Textures
  */
 
 interface Vector3 { x: number; y: number; z: number; }
@@ -25,6 +25,15 @@ interface WorkerPayload {
   normals?: Float32Array;
   emissive?: Float32Array;
   ao?: Float32Array;
+  
+  uvs?: Float32Array;
+  textureIndices?: Float32Array;
+  roughness?: Float32Array;
+  metallic?: Float32Array;
+  ormTextureIndices?: Float32Array;
+  emissiveTextureIndices?: Float32Array;
+  textures?: { width: number, height: number, pixels: Uint8Array }[];
+  
   lights?: LightDef[];
   startX: number; startY: number; width: number; height: number;
   canvasWidth: number; canvasHeight: number;
@@ -37,7 +46,6 @@ const BVH_NODE_SIZE = 10;
 const SHADOW_EPSILON = 0.005;
 
 // ── GLOBAL WORKER STATE ───────────────────────────────────────────
-// These persist in the Web Worker thread memory across all messages
 let positions: Float32Array | null = null;
 let bvhBuffer: Float32Array | null = null;
 let indices: Uint32Array | null = null;
@@ -45,6 +53,61 @@ let colors: Float32Array | undefined;
 let normals: Float32Array | undefined;
 let emissive: Float32Array | undefined;
 let ao: Float32Array | undefined;
+
+let uvs: Float32Array | undefined;
+let textureIndices: Float32Array | undefined;
+let roughnessArray: Float32Array | undefined;
+let metallicArray: Float32Array | undefined;
+let ormTextureIndices: Float32Array | undefined;
+let emissiveTextureIndices: Float32Array | undefined;
+let textures: { width: number, height: number, pixels: Uint8Array }[] = [];
+
+// ── BILINEAR TEXTURE SAMPLER ──
+function sampleTextureBilinear(tex: { width: number, height: number, pixels: Uint8Array }, u: number, v: number, isSRGB: boolean) {
+  let u_wrap = u - Math.floor(u);
+  let v_wrap = v - Math.floor(v); // GLTF and Canvas share the same top-left origin!
+
+  const u_img = u_wrap * tex.width - 0.5;
+  const v_img = v_wrap * tex.height - 0.5;
+
+  const x0 = Math.max(0, Math.floor(u_img));
+  const y0 = Math.max(0, Math.floor(v_img));
+  const x1 = Math.min(tex.width - 1, x0 + 1);
+  const y1 = Math.min(tex.height - 1, y0 + 1);
+
+  const frac_x = u_img - Math.floor(u_img);
+  const frac_y = v_img - Math.floor(v_img);
+
+  const getPixel = (px: number, py: number) => {
+    const idx = (py * tex.width + px) * 4;
+    let r = tex.pixels[idx] / 255.0;
+    let g = tex.pixels[idx + 1] / 255.0;
+    let b = tex.pixels[idx + 2] / 255.0;
+    
+    // Convert sRGB color textures to linear space for accurate light math
+    if (isSRGB) {
+      r = Math.pow(r, 2.2); g = Math.pow(g, 2.2); b = Math.pow(b, 2.2);
+    }
+    return { r, g, b };
+  };
+
+  const p00 = getPixel(x0, y0); const p10 = getPixel(x1, y0);
+  const p01 = getPixel(x0, y1); const p11 = getPixel(x1, y1);
+
+  const c0r = p00.r * (1 - frac_x) + p10.r * frac_x;
+  const c0g = p00.g * (1 - frac_x) + p10.g * frac_x;
+  const c0b = p00.b * (1 - frac_x) + p10.b * frac_x;
+  
+  const c1r = p01.r * (1 - frac_x) + p11.r * frac_x;
+  const c1g = p01.g * (1 - frac_x) + p11.g * frac_x;
+  const c1b = p01.b * (1 - frac_x) + p11.b * frac_x;
+
+  return {
+    r: c0r * (1 - frac_y) + c1r * frac_y,
+    g: c0g * (1 - frac_y) + c1g * frac_y,
+    b: c0b * (1 - frac_y) + c1b * frac_y
+  };
+}
 
 self.onmessage = (event: MessageEvent<WorkerPayload | any>) => {
   const { type } = event.data;
@@ -58,29 +121,34 @@ self.onmessage = (event: MessageEvent<WorkerPayload | any>) => {
     normals = event.data.normals;
     emissive = event.data.emissive;
     ao = event.data.ao;
-    console.log(`[Worker-Web] Geometry primed: ${positions!.length / 3} vertices.`);
+    
+    uvs = event.data.uvs;
+    textureIndices = event.data.textureIndices;
+    roughnessArray = event.data.roughness;
+    metallicArray = event.data.metallic;
+    ormTextureIndices = event.data.ormTextureIndices;
+    emissiveTextureIndices = event.data.emissiveTextureIndices;
+    textures = event.data.textures || [];
+    
+    console.log(`[Worker-Web] Geometry primed: ${positions!.length / 3} verts, ${textures.length} textures.`);
     return;
   }
 
   // ── 2. RENDER TILE ─────────────────────────────────────────────
-  // Extracting local variables for this specific task
   let { startX, startY, width, height, canvasWidth, canvasHeight, lights } = event.data;
   let cameraPos: Vector3, viewMatrix: number[], sunDir: Vector3, fov: number;
 
-  // Handle nested or flat camera data
   if (event.data.camera) {
     ({ cameraPos, viewMatrix, fov, sunDir } = event.data.camera);
   } else {
     ({ cameraPos, viewMatrix, fov, sunDir } = event.data);
   }
 
-  // 🛑 THE CRASH PROTECTOR: Stop if we haven't received geometry yet
   if (!positions || !bvhBuffer || !indices) {
     console.warn(`[Worker-Web] Dropped tile [${startX}, ${startY}]: Geometry not initialized.`);
     return;
   }
 
-  // Default fallbacks
   lights = lights || [];
   if (!viewMatrix) viewMatrix = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
   if (!cameraPos) cameraPos = { x: 0, y: 0, z: 0 };
@@ -88,7 +156,6 @@ self.onmessage = (event: MessageEvent<WorkerPayload | any>) => {
   sunDir = normalize(sunDir);
   if (!fov || fov <= 0) fov = 50;
 
-  // ── Shadow-ray test ──
   function isOccluded(origin: Vector3, dir: Vector3, maxDist: number): boolean {
     const stack = new Uint32Array(64);
     let stackPtr = 0;
@@ -176,12 +243,15 @@ self.onmessage = (event: MessageEvent<WorkerPayload | any>) => {
           z: cameraPos.z + rd.z * closestT,
         };
 
+        const w0 = 1 - hitU - hitV;
+        const w1 = hitU;
+        const w2 = hitV;
+
         let shadingNormal = hitNormal;
         if (normals && normals.length > 0) {
           const nA: Vector3 = { x: normals[hitA], y: normals[hitA + 1], z: normals[hitA + 2] };
           const nB: Vector3 = { x: normals[hitB], y: normals[hitB + 1], z: normals[hitB + 2] };
           const nC: Vector3 = { x: normals[hitC], y: normals[hitC + 1], z: normals[hitC + 2] };
-          const w0 = 1 - hitU - hitV, w1 = hitU, w2 = hitV;
           shadingNormal = normalize({
             x: w0 * nA.x + w1 * nB.x + w2 * nC.x,
             y: w0 * nA.y + w1 * nB.y + w2 * nC.y,
@@ -192,18 +262,51 @@ self.onmessage = (event: MessageEvent<WorkerPayload | any>) => {
         const geoN = dot(hitNormal, rd) > 0 ? { x: -hitNormal.x, y: -hitNormal.y, z: -hitNormal.z } : hitNormal;
         const N = dot(shadingNormal, rd) > 0 ? { x: -shadingNormal.x, y: -shadingNormal.y, z: -shadingNormal.z } : shadingNormal;
 
+        const vertIndexA = hitA / 3;
+        let u = 0, v = 0;
+        
+        if (uvs && uvs.length > 0) {
+          const uvIdxA = vertIndexA * 2;
+          const uvIdxB = (hitB / 3) * 2;
+          const uvIdxC = (hitC / 3) * 2;
+          u = w0 * uvs[uvIdxA] + w1 * uvs[uvIdxB] + w2 * uvs[uvIdxC];
+          v = w0 * uvs[uvIdxA + 1] + w1 * uvs[uvIdxB + 1] + w2 * uvs[uvIdxC + 1];
+        }
+
+        // ── 1. Diffuse Color ──
         let albR = 0.78, albG = 0.78, albB = 0.78;
-        if (colors && colors.length > 0) {
+        const diffuseIdx = (textureIndices && textureIndices.length > 0) ? textureIndices[vertIndexA] : -1;
+        
+        if (diffuseIdx >= 0 && diffuseIdx < textures.length) {
+          const colorSample = sampleTextureBilinear(textures[diffuseIdx], u, v, true);
+          albR = colorSample.r; albG = colorSample.g; albB = colorSample.b;
+        } else if (colors && colors.length > 0) {
           const ci = hitVertA * 3;
           albR = colors[ci]; albG = colors[ci + 1]; albB = colors[ci + 2];
         }
 
-        let aoFactor = 1.0;
-        if (ao && ao.length > 0) aoFactor = ao[hitVertA];
-
-        const roughness = 0.5;
-        const metallic = 0.0;
-        const F0 = metallic > 0.5 ? { r: 0.9, g: 0.9, b: 0.9 } : { r: 0.04, g: 0.04, b: 0.04 };
+        // ── 2. PBR Properties (ORM) ──
+        let roughness = (roughnessArray && roughnessArray.length > 0) ? roughnessArray[vertIndexA] : 0.5;
+        let metallic = (metallicArray && metallicArray.length > 0) ? metallicArray[vertIndexA] : 0.0;
+        let aoFactor = (ao && ao.length > 0) ? ao[hitVertA] : 1.0;
+        
+        const ormIdx = (ormTextureIndices && ormTextureIndices.length > 0) ? ormTextureIndices[vertIndexA] : -1;
+        if (ormIdx >= 0 && ormIdx < textures.length) {
+          // False = Do not gamma correct ORM data!
+          const ormSample = sampleTextureBilinear(textures[ormIdx], u, v, false);
+          
+          // GLTF ORM: R=AO, G=Roughness, B=Metallic
+          aoFactor *= ormSample.r; 
+          roughness *= ormSample.g;
+          metallic *= ormSample.b;
+        }
+        
+        // Clamp to physics-safe values
+        roughness = Math.max(0.04, Math.min(1.0, roughness));
+        metallic = Math.max(0.0, Math.min(1.0, metallic));
+        
+        // F0 is the base reflectivity.
+        const F0 = metallic > 0.5 ? { r: albR, g: albG, b: albB } : { r: 0.04, g: 0.04, b: 0.04 };
 
         let totalR = 0, totalG = 0, totalB = 0;
         const ambientStrength = 0.15 * aoFactor;
@@ -211,17 +314,23 @@ self.onmessage = (event: MessageEvent<WorkerPayload | any>) => {
         totalG += albG * ambientStrength;
         totalB += albB * ambientStrength;
 
+        // ── 3. Lighting Math ──
         for (const light of lights) {
           let L: Vector3, lightDist: number, attenuation = 1.0, spotFactor = 1.0;
           if (light.type === 'directional') {
             L = normalize({ x: -light.direction.x, y: -light.direction.y, z: -light.direction.z });
             lightDist = 1e6;
-            attenuation = light.intensity;
+            // Directional lights shouldn't be insanely bright in our simple model
+            attenuation = Math.min(light.intensity, 3.0); 
           } else {
             const toLight = sub(light.position, hitP);
             lightDist = Math.sqrt(dot(toLight, toLight));
             L = { x: toLight.x / lightDist, y: toLight.y / lightDist, z: toLight.z / lightDist };
-            attenuation = light.distance > 0 && lightDist > light.distance ? 0 : light.intensity / Math.max(1, Math.pow(lightDist, light.decay || 2));
+            
+            // Standard inverse-square falloff, clamped to prevent blowing out when light is very close to surface
+            const distanceSquare = Math.max(0.1, dot(toLight, toLight));
+            attenuation = light.distance > 0 && lightDist > light.distance ? 0 : light.intensity / distanceSquare;
+            
             if (light.type === 'spot') {
               const cosAngle = -dot(L, normalize(light.direction));
               const cosCone = Math.cos(light.angle), cosPenumbra = Math.cos(light.angle * (1 - light.penumbra));
@@ -229,27 +338,76 @@ self.onmessage = (event: MessageEvent<WorkerPayload | any>) => {
             }
           }
           if (attenuation * spotFactor < 0.001) continue;
+          
           const NdotL = Math.max(0, dot(N, L));
-          if (NdotL <= 0 || isOccluded({ x: hitP.x + geoN.x * SHADOW_EPSILON, y: hitP.y + geoN.y * SHADOW_EPSILON, z: hitP.z + geoN.z * SHADOW_EPSILON }, L, lightDist)) continue;
+          if (NdotL <= 0) continue;
+          
+          // Shadow Ray
+          if (isOccluded({ x: hitP.x + geoN.x * SHADOW_EPSILON, y: hitP.y + geoN.y * SHADOW_EPSILON, z: hitP.z + geoN.z * SHADOW_EPSILON }, L, lightDist)) continue;
 
-          const V = normalize(sub(cameraPos, hitP)), H = normalize({ x: L.x + V.x, y: L.y + V.y, z: L.z + V.z });
-          const NdotH = Math.max(0.001, dot(N, H)), VdotH = Math.max(0.001, dot(V, H)), NdotV = Math.max(0.001, dot(N, V));
-          const alpha2 = Math.pow(roughness * roughness, 2);
-          const D = alpha2 / (Math.pow(NdotH * NdotH * (alpha2 - 1.0) + 1.0, 2) * 3.14159);
+          const V = normalize(sub(cameraPos, hitP));
+          const H = normalize({ x: L.x + V.x, y: L.y + V.y, z: L.z + V.z });
+          
+          const NdotH = Math.max(0.001, dot(N, H));
+          const VdotH = Math.max(0.001, dot(V, H));
+          const NdotV = Math.max(0.001, dot(N, V));
+          
+          // GGX Specular - clamped roughness to prevent divide-by-zero explosions
+          const safeRoughness = Math.max(0.08, roughness); 
+          const alpha2 = Math.pow(safeRoughness * safeRoughness, 2);
+          const D = alpha2 / (Math.pow(NdotH * NdotH * (alpha2 - 1.0) + 1.0, 2) * Math.PI);
+          
           const fresnel = (a: number) => a + (1.0 - a) * Math.pow(Math.max(0, 1.0 - VdotH), 5.0);
-          const k = Math.pow(roughness + 1.0, 2) / 8.0;
+          const F = { r: fresnel(F0.r), g: fresnel(F0.g), b: fresnel(F0.b) };
+          
+          const k = Math.pow(safeRoughness + 1.0, 2) / 8.0;
           const G = 1.0 / (NdotV * (1.0 - k) + k) / (NdotL * (1.0 - k) + k);
-          const specBrdf = D * fresnel(F0.r) * G / (4.0 * NdotV * NdotL);
+          
+          // Calculate specular with a safety clamp to prevent infinite spikes
+          const denominator = Math.max(0.001, 4.0 * NdotV * NdotL);
+          let specBrdfR = Math.min(10.0, (D * F.r * G) / denominator);
+          let specBrdfG = Math.min(10.0, (D * F.g * G) / denominator);
+          let specBrdfB = Math.min(10.0, (D * F.b * G) / denominator);
 
-          totalR += (albR * (1.0 - metallic) * NdotL * attenuation * spotFactor / 3.14159 + specBrdf * attenuation * spotFactor) * light.color.r;
-          totalG += (albG * (1.0 - metallic) * NdotL * attenuation * spotFactor / 3.14159 + specBrdf * attenuation * spotFactor) * light.color.g;
-          totalB += (albB * (1.0 - metallic) * NdotL * attenuation * spotFactor / 3.14159 + specBrdf * attenuation * spotFactor) * light.color.b;
+          // Energy conservation: diffuse light is whatever light WASN'T reflected as specular
+          const kD_r = (1.0 - F.r) * (1.0 - metallic);
+          const kD_g = (1.0 - F.g) * (1.0 - metallic);
+          const kD_b = (1.0 - F.b) * (1.0 - metallic);
+
+          // Combine Diffuse and Specular, multiply by light intensity and angle
+          const radiance = attenuation * spotFactor * NdotL;
+
+          totalR += ((albR * kD_r) / Math.PI + specBrdfR) * light.color.r * radiance;
+          totalG += ((albG * kD_g) / Math.PI + specBrdfG) * light.color.g * radiance;
+          totalB += ((albB * kD_b) / Math.PI + specBrdfB) * light.color.b * radiance;
         }
 
+        // ── 4. Emissive Texture (The Glowing Blue Visor!) ──
+        let emiR = 0, emiG = 0, emiB = 0;
+        const emiIdx = (emissiveTextureIndices && emissiveTextureIndices.length > 0) ? emissiveTextureIndices[vertIndexA] : -1;
+        
+        if (emiIdx >= 0 && emiIdx < textures.length) {
+          // Sample the glowing texture (sRGB = true)
+          const emiSample = sampleTextureBilinear(textures[emiIdx], u, v, true);
+          emiR = emiSample.r; emiG = emiSample.g; emiB = emiSample.b;
+        } else if (emissive && emissive.length > 0) {
+          // Fallback to flat material glow
+          const ei = hitVertA * 3;
+          if (ei + 2 < emissive.length) {
+            emiR = emissive[ei]; emiG = emissive[ei + 1]; emiB = emissive[ei + 2];
+          }
+        }
+
+        // Add the glow to the final pixel color (independent of external lighting)
+        totalR += emiR * 5.0;
+        totalG += emiG * 5.0;
+        totalB += emiB * 5.0;
+
+        // ACES Tone mapping & Gamma Correction
         const aces = (v: number) => (v * (2.51 * v + 0.03)) / (v * (2.43 * v + 0.59) + 0.14);
-        pixels[pixelIdx++] = Math.min(255, Math.round(Math.pow(aces(totalR), 1 / 2.2) * 255));
-        pixels[pixelIdx++] = Math.min(255, Math.round(Math.pow(aces(totalG), 1 / 2.2) * 255));
-        pixels[pixelIdx++] = Math.min(255, Math.round(Math.pow(aces(totalB), 1 / 2.2) * 255));
+        pixels[pixelIdx++] = Math.min(255, Math.max(0, Math.round(Math.pow(aces(totalR), 1 / 2.2) * 255)));
+        pixels[pixelIdx++] = Math.min(255, Math.max(0, Math.round(Math.pow(aces(totalG), 1 / 2.2) * 255)));
+        pixels[pixelIdx++] = Math.min(255, Math.max(0, Math.round(Math.pow(aces(totalB), 1 / 2.2) * 255)));
         pixels[pixelIdx++] = 255;
       } else {
         pixels[pixelIdx++] = 18; pixels[pixelIdx++] = 18; pixels[pixelIdx++] = 20; pixels[pixelIdx++] = 255;
