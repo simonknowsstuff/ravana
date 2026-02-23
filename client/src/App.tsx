@@ -201,6 +201,12 @@ function App() {
   const [renderElapsed, setRenderElapsed] = useState<string>('')
   const [imageFormat, setImageFormat] = useState<'png' | 'jpeg'>('png')
   const [jpegQuality, setJpegQuality] = useState<number>(0.95)
+  
+  // Tile buffer queue for batched canvas updates
+  const tileQueueRef = useRef<Array<{ buffer: ArrayBuffer | Uint8Array; startX: number; startY: number; width: number; height: number; retries?: number }>>([])
+  const processingTilesRef = useRef(false)
+  const animFrameRef = useRef<number | null>(null)
+  const paintedTilesRef = useRef<Set<string>>(new Set()) // Track which tiles have been painted (key: "x,y")
 
   // Download rendered image
   const handleDownloadImage = useCallback(() => {
@@ -267,42 +273,142 @@ function App() {
       setIsConnected(false)
     })
 
-    // Listen for completed tiles from workers
-    socket.on('render_update', (payload: { buffer: ArrayBuffer | Uint8Array; startX: number; startY: number; width: number; height: number }) => {
+    // Process tile queue in batches for better performance
+    const processTileQueue = () => {
+      if (processingTilesRef.current || tileQueueRef.current.length === 0) {
+        animFrameRef.current = null
+        return
+      }
+
+      processingTilesRef.current = true
       const canvas = canvasRef.current
-      if (!canvas) return
-      const ctx = canvas.getContext('2d')
-      if (!ctx) return
+      const ctx = canvas?.getContext('2d')
 
-      try {
-        const { startX, startY, width, height } = payload
-        // Ensure we have a proper ArrayBuffer
-        const raw = payload.buffer instanceof ArrayBuffer
-          ? payload.buffer
-          : new Uint8Array(payload.buffer).buffer
-        const pixels = new Uint8ClampedArray(raw)
+      if (!canvas || !ctx) {
+        processingTilesRef.current = false
+        animFrameRef.current = null
+        return
+      }
 
-        // Validate buffer size matches tile dimensions
-        const expected = width * height * 4
-        if (pixels.length !== expected) {
-          console.error(`[render] Buffer size mismatch: got ${pixels.length}, expected ${expected} for ${width}x${height} tile`)
-          return
+      // Process all queued tiles in this frame (or limit to batch size if needed)
+      const batch = tileQueueRef.current.splice(0, tileQueueRef.current.length)
+      let successCount = 0
+      let failedTiles: Array<{ buffer: ArrayBuffer | Uint8Array; startX: number; startY: number; width: number; height: number; reason: string; retries?: number }> = []
+
+      for (const payload of batch) {
+        const retries = payload.retries || 0
+        const MAX_RETRIES = 3
+        
+        try {
+          const { startX, startY, width, height } = payload
+          // Ensure we have a proper ArrayBuffer
+          const raw = payload.buffer instanceof ArrayBuffer
+            ? payload.buffer
+            : new Uint8Array(payload.buffer).buffer
+          const pixels = new Uint8ClampedArray(raw)
+
+          // Validate buffer size matches tile dimensions
+          const expected = width * height * 4
+          if (pixels.length !== expected) {
+            console.error(`[render] Buffer size mismatch: got ${pixels.length}, expected ${expected} for ${width}x${height} tile at (${startX},${startY})`)
+            if (retries < MAX_RETRIES) {
+              failedTiles.push({ buffer: payload.buffer, startX, startY, width, height, reason: 'size_mismatch', retries: retries + 1 })
+            } else {
+              console.error(`[render] Tile (${startX},${startY}) failed after ${MAX_RETRIES} retries, giving up`)
+            }
+            continue
+          }
+
+          const imageData = new ImageData(pixels, width, height)
+          ctx.putImageData(imageData, startX, startY)
+          paintedTilesRef.current.add(`${startX},${startY}`)
+          successCount++
+        } catch (err) {
+          console.error(`[render] Failed to paint tile at (${payload.startX},${payload.startY}):`, err)
+          if (retries < MAX_RETRIES) {
+            failedTiles.push({ buffer: payload.buffer, startX: payload.startX, startY: payload.startY, width: payload.width, height: payload.height, reason: 'paint_error', retries: retries + 1 })
+          } else {
+            console.error(`[render] Tile (${payload.startX},${payload.startY}) failed after ${MAX_RETRIES} retries, giving up`)
+          }
         }
+      }
 
-        const imageData = new ImageData(pixels, width, height)
-        ctx.putImageData(imageData, startX, startY)
+      // Retry failed tiles (put them back at the front of the queue)
+      if (failedTiles.length > 0) {
+        console.warn(`[render] ${failedTiles.length} tile(s) failed to paint, will retry`)
+        tileQueueRef.current.unshift(...failedTiles)
+      }
 
-        setTilesReceived(prev => prev + 1)
-        console.log(`[render] painted tile at [${startX}, ${startY}] (${width}x${height})`)
-      } catch (err) {
-        console.error('[render] Failed to paint tile:', err)
+      if (successCount > 0) {
+        setTilesReceived(prev => prev + successCount)
+        if (successCount > 1) {
+          console.log(`[render] painted ${successCount} tiles in batch`)
+        }
+      }
+
+      processingTilesRef.current = false
+
+      // Schedule next frame if there are more tiles
+      if (tileQueueRef.current.length > 0) {
+        animFrameRef.current = requestAnimationFrame(processTileQueue)
+      } else {
+        animFrameRef.current = null
+      }
+    }
+
+    // Listen for completed tiles from workers - add to queue and acknowledge
+    socket.on('render_update', (payload: { buffer: ArrayBuffer | Uint8Array; startX: number; startY: number; width: number; height: number }, acknowledgeFn) => {
+      // Add tile to queue
+      console.log(`[render] received tile (${payload.startX},${payload.startY}) — queue size: ${tileQueueRef.current.length + 1}`)
+      tileQueueRef.current.push(payload)
+
+      // Send acknowledgment immediately to confirm receipt
+      if (acknowledgeFn && typeof acknowledgeFn === 'function') {
+        acknowledgeFn({ status: 'received', queueSize: tileQueueRef.current.length })
+      }
+
+      // Schedule processing if not already scheduled
+      if (!animFrameRef.current) {
+        animFrameRef.current = requestAnimationFrame(processTileQueue)
       }
     })
 
     return () => {
       socket.disconnect()
+      // Clean up animation frame on unmount
+      if (animFrameRef.current !== null) {
+        cancelAnimationFrame(animFrameRef.current)
+      }
     }
   }, [])
+
+  // Check for missing tiles when render appears complete
+  useEffect(() => {
+    if (tilesReceived > 0 && tilesReceived === totalTiles && totalTiles > 0) {
+      console.log(`[render] Render complete: ${tilesReceived}/${totalTiles} tiles painted`)
+      
+      // Check if all expected tiles were painted
+      const expectedTiles = new Set<string>()
+      for (let y = 0; y < renderHeight; y += tileSize) {
+        for (let x = 0; x < renderWidth; x += tileSize) {
+          expectedTiles.add(`${x},${y}`)
+        }
+      }
+      
+      const missingTiles: string[] = []
+      for (const expectedKey of expectedTiles) {
+        if (!paintedTilesRef.current.has(expectedKey)) {
+          missingTiles.push(expectedKey)
+        }
+      }
+      
+      if (missingTiles.length > 0) {
+        console.error(`[render] WARNING: ${missingTiles.length} tiles were never painted:`, missingTiles.slice(0, 10))
+      } else {
+        console.log(`[render] ✓ All ${totalTiles} tiles successfully painted`)
+      }
+    }
+  }, [tilesReceived, totalTiles, renderHeight, renderWidth, tileSize])
 
   // Open render settings modal
   const handleOpenRenderSettings = useCallback(() => {
@@ -333,6 +439,15 @@ function App() {
       setTilesReceived(0)
       setIsRendering(true)
       setRenderStartTime(Date.now())
+      
+      // Clear tile queue and painted tiles tracking from any previous render
+      tileQueueRef.current = []
+      paintedTilesRef.current.clear()
+      if (animFrameRef.current !== null) {
+        cancelAnimationFrame(animFrameRef.current)
+        animFrameRef.current = null
+      }
+      processingTilesRef.current = false
 
       // Initialize canvas to black
       const canvas = canvasRef.current

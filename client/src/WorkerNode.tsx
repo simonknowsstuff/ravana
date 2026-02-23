@@ -32,8 +32,12 @@ export default function WorkerNode() {
   const exposureRef = useRef<number>(0); // EV compensation
   const lightScaleRef = useRef<number>(1.0); // Light intensity multiplier
   
-  // THE WAITING ROOM: Holds a task if it arrives before the geometry
-  const pendingTaskRef = useRef<any>(null);
+  // THE WAITING ROOM: Holds tasks if they arrive before geometry or while rendering
+  const pendingTasksRef = useRef<any[]>([]);
+  const isRenderingRef = useRef<boolean>(false);
+  const geometryVersionRef = useRef<number>(0);
+  const pendingGeometryRef = useRef<any>(null);
+  const processGeometryRef = useRef<((payload: any) => Promise<void>) | null>(null);
 
   // Helper function to render a tile
   const renderTile = useCallback(async (task: any) => {
@@ -42,7 +46,11 @@ export default function WorkerNode() {
       return;
     }
 
-    const { startX, startY, width, height, canvasWidth, canvasHeight, camera: cameraData, samples: taskSamples } = task;
+    // Mark as rendering to prevent geometry updates
+    isRenderingRef.current = true;
+    const renderGeometryVersion = geometryVersionRef.current;
+
+    const { startX, startY, width, height, canvasWidth, canvasHeight, camera: cameraData, samples: taskSamples, masterSocketId } = task;
     
     console.log(`[Render] Tile [${startX},${startY}] ${width}x${height} of ${canvasWidth}x${canvasHeight} with ${taskSamples || 16} samples`);
     
@@ -158,7 +166,44 @@ export default function WorkerNode() {
     // Read tile pixels
     const gl = rendererRef.current.getContext();
     const pixels = new Uint8Array(width * height * 4);
-    gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+    
+    try {
+      // Check for WebGL errors before reading pixels
+      const preError = gl.getError();
+      if (preError !== gl.NO_ERROR) {
+        console.error(`[Render] WebGL error before readPixels: ${preError}`);
+      }
+      
+      gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+      
+      // Check if readPixels succeeded
+      const postError = gl.getError();
+      if (postError !== gl.NO_ERROR) {
+        console.error(`[Render] WebGL error during readPixels: ${postError}`);
+        console.error(`[Render] This is common on mobile devices with limited GPU memory`);
+        // Don't throw - let's try to send what we have
+      }
+      
+      // Verify we got valid data (check if all pixels are black/zero)
+      let nonZeroPixels = 0;
+      for (let i = 0; i < pixels.length; i += 4) {
+        if (pixels[i] !== 0 || pixels[i + 1] !== 0 || pixels[i + 2] !== 0) {
+          nonZeroPixels++;
+          if (nonZeroPixels > 10) break; // Early exit if we found some data
+        }
+      }
+      
+      if (nonZeroPixels === 0) {
+        console.warn(`[Render] WARNING: All pixels are black!`);
+        console.warn(`[Render] Context state: isContextLost=${gl.isContextLost()}`);
+        console.warn(`[Render] This may indicate GPU memory issues or rendering failure`);
+      } else {
+        console.log(`[Render] Pixel data OK: ${nonZeroPixels}+ non-black pixels found`);
+      }
+    } catch (err: any) {
+      console.error(`[Render] Exception reading pixels:`, err);
+      // Continue with potentially black pixels rather than failing completely
+    }
     
     // Flip Y coordinate
     const flippedPixels = new Uint8Array(width * height * 4);
@@ -175,27 +220,97 @@ export default function WorkerNode() {
     
     console.log(`[Render] Tile complete, sending...`);
     
-    // Send result back to server
+    // Check if geometry was updated during render
+    if (renderGeometryVersion !== geometryVersionRef.current) {
+      console.warn(`[Render] Geometry changed during render (v${renderGeometryVersion} -> v${geometryVersionRef.current}), tile may be invalid`);
+    }
+    
+    // Mark as not rendering BEFORE sending tile_finished
+    // This ensures the worker can accept new tiles immediately
+    isRenderingRef.current = false;
+    
+    // Send result back to server with masterSocketId for proper routing
+    // Use acknowledgment to ensure server received the tile
+    console.log(`[Render] Emitting tile_finished for (${startX},${startY})`);
     socketRef.current.emit('tile_finished', {
       buffer: flippedPixels.buffer,
       startX,
       startY,
       width,
-      height
+      height,
+      masterSocketId
+    }, (ack: any) => {
+      if (ack && ack.status === 'received') {
+        console.log(`[Render] Server acknowledged tile (${startX},${startY}), pool size: ${ack.poolSize}`);
+      } else if (ack && ack.status === 'error') {
+        console.error(`[Render] Server reported error for tile (${startX},${startY}): ${ack.error}`);
+      } else if (ack && ack.status === 'skipped') {
+        console.log(`[Render] Server skipped and requeued tile (${startX},${startY})`);
+      } else {
+        console.warn(`[Render] No acknowledgment from server for tile (${startX},${startY})`);
+      }
     });
 
     setTilesProcessed((prev) => prev + 1);
-    setStatus('Tile complete. Requesting next...');
+    setStatus('Tile complete. Ready for next...');
+    
+    // If geometry update arrived while rendering, process it now
+    if (pendingGeometryRef.current && processGeometryRef.current) {
+      console.log('[Render] Processing queued geometry update...');
+      const pendingPayload = pendingGeometryRef.current;
+      pendingGeometryRef.current = null;
+      // Process the queued geometry update (it will emit worker_ready when done)
+      await processGeometryRef.current(pendingPayload);
+    } else {
+      // No pending geometry update - signal we're ready for next tile
+      console.log(`[Render] Emitting worker_ready after tile (${startX},${startY})`);
+      if (socketRef.current) {
+        socketRef.current.emit('worker_ready');
+      }
+    }
   }, []);
 
   useEffect(() => {
     let isMounted = true;
+    
+    // Detect mobile device
+    const checkMobile = () => {
+      const ua = navigator.userAgent.toLowerCase();
+      const isMobileUA = /android|webos|iphone|ipad|ipod|blackberry|iemobile|opera mini/i.test(ua);
+      const isMobileTouchScreen = ('ontouchstart' in window) && navigator.maxTouchPoints > 1;
+      return isMobileUA || isMobileTouchScreen;
+    };
+    const mobile = checkMobile();
+    console.log(`[Device] Mobile device detected: ${mobile}`);
     
     // Create hidden canvas for GPU rendering
     const canvas = document.createElement('canvas');
     canvas.style.display = 'none';
     document.body.appendChild(canvas);
     canvasRef.current = canvas;
+    
+    // Add WebGL context loss handlers (critical for mobile)
+    const handleContextLost = (event: Event) => {
+      event.preventDefault();
+      console.error('[WebGL] Context lost! This is common on mobile devices.');
+      setErrorLog('GPU context lost. Reconnecting...');
+      setStatus('GPU context lost. Please refresh.');
+      isRenderingRef.current = false;
+      // Notify server that we're not available
+      if (socketRef.current) {
+        socketRef.current.emit('worker_unavailable', { reason: 'context_lost' });
+      }
+    };
+    
+    const handleContextRestored = () => {
+      console.log('[WebGL] Context restored. Reconnecting...');
+      setErrorLog('GPU context restored.');
+      // We'd need to rebuild everything - for now just ask for refresh
+      setStatus('GPU restored. Please refresh page.');
+    };
+    
+    canvas.addEventListener('webglcontextlost', handleContextLost, false);
+    canvas.addEventListener('webglcontextrestored', handleContextRestored, false);
 
     const serverUrl = import.meta.env.VITE_WS_SERVER_URL || `http://${window.location.hostname}:3000`;
     const socket = io(serverUrl, {
@@ -226,11 +341,10 @@ export default function WorkerNode() {
       setErrorLog(`Connection error: ${error.message}`);
     });
 
-    // 3. THE UNPACKER — read pre-merged scene geometry from the binary buffer
-    socket.on('sync_geometry', async (payload) => {
-      if (!isMounted) return;
-      
+    // Helper function to process geometry updates (defined in useEffect scope)
+    const processGeometryUpdate = async (payload: any) => {
       try {
+        geometryVersionRef.current++;
         setStatus('Unpacking Geometry...');
         const { metadata, buffer } = payload;
         
@@ -388,39 +502,66 @@ export default function WorkerNode() {
         
         // Setup renderer and pathtracer
         if (!rendererRef.current && canvasRef.current) {
-          const renderer = new THREE.WebGLRenderer({ 
-            canvas: canvasRef.current,
-            antialias: false,
-            powerPreference: 'high-performance',
-            stencil: false,
-            depth: true
-          });
-          renderer.outputColorSpace = THREE.SRGBColorSpace;
-          renderer.toneMapping = THREE.ACESFilmicToneMapping;
-          renderer.toneMappingExposure = 1.0; // Will be updated per-render
-          
-          // Enable shadow rendering
-          renderer.shadowMap.enabled = true;
-          renderer.shadowMap.type = THREE.PCFShadowMap; // High quality shadows
-          
-          rendererRef.current = renderer;
-          
-          const pathtracer = new WebGLPathTracer(renderer);
-          pathtracer.tiles.set(1, 1);
-          
-          // Configure pathtracer for maximum quality
-          // @ts-ignore - WebGLPathTracer properties
-          if (pathtracer.bounces !== undefined) pathtracer.bounces = 8; // Max ray bounces for indirect lighting
-          // @ts-ignore
-          if (pathtracer.transmissiveBounces !== undefined) pathtracer.transmissiveBounces = 8; // Bounces through glass
-          // @ts-ignore
-          if (pathtracer.filterGlossyFactor !== undefined) pathtracer.filterGlossyFactor = 0.5; // Reduce fireflies
-          // @ts-ignore - Additional settings to reduce shadow acne
-          if (pathtracer.dynamicLowRes !== undefined) pathtracer.dynamicLowRes = false;
-          // @ts-ignore
-          if (pathtracer.minSamples !== undefined) pathtracer.minSamples = 1;
-          
-          pathtracerRef.current = pathtracer;
+          try {
+            // Use mobile-friendly settings
+            const isMobileDevice = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+            console.log(`[GPU] Initializing WebGL renderer (mobile: ${isMobileDevice})`);
+            
+            const renderer = new THREE.WebGLRenderer({ 
+              canvas: canvasRef.current,
+              antialias: false,
+              powerPreference: isMobileDevice ? 'default' : 'high-performance',
+              stencil: false,
+              depth: true,
+              failIfMajorPerformanceCaveat: false // Don't fail on slow devices
+            });
+            
+            // Verify WebGL context was created
+            const gl = renderer.getContext();
+            if (!gl) {
+              throw new Error('Failed to get WebGL context from renderer');
+            }
+            
+            console.log(`[GPU] WebGL context created successfully`);
+            console.log(`[GPU] WebGL version: ${gl.getParameter(gl.VERSION)}`);
+            console.log(`[GPU] Renderer: ${gl.getParameter(gl.RENDERER)}`);
+            console.log(`[GPU] Max texture size: ${gl.getParameter(gl.MAX_TEXTURE_SIZE)}`);
+            
+            renderer.outputColorSpace = THREE.SRGBColorSpace;
+            renderer.toneMapping = THREE.ACESFilmicToneMapping;
+            renderer.toneMappingExposure = 1.0; // Will be updated per-render
+            
+            // Enable shadow rendering - use simpler shadows on mobile
+            renderer.shadowMap.enabled = true;
+            renderer.shadowMap.type = isMobileDevice ? THREE.BasicShadowMap : THREE.PCFShadowMap;
+            console.log(`[GPU] Shadow map type: ${isMobileDevice ? 'BasicShadowMap' : 'PCFShadowMap'}`);
+            
+            rendererRef.current = renderer;
+            
+            console.log(`[GPU] Creating WebGLPathTracer...`);
+            const pathtracer = new WebGLPathTracer(renderer);
+            pathtracer.tiles.set(1, 1);
+            
+            // Configure pathtracer - use lower settings on mobile
+            const bounces = isMobileDevice ? 4 : 8;
+            // @ts-ignore - WebGLPathTracer properties
+            if (pathtracer.bounces !== undefined) pathtracer.bounces = bounces;
+            // @ts-ignore
+            if (pathtracer.transmissiveBounces !== undefined) pathtracer.transmissiveBounces = bounces;
+            // @ts-ignore
+            if (pathtracer.filterGlossyFactor !== undefined) pathtracer.filterGlossyFactor = 0.5;
+            // @ts-ignore
+            if (pathtracer.dynamicLowRes !== undefined) pathtracer.dynamicLowRes = false;
+            // @ts-ignore
+            if (pathtracer.minSamples !== undefined) pathtracer.minSamples = 1;
+            
+            console.log(`[GPU] Pathtracer configured with ${bounces} bounces`);
+            pathtracerRef.current = pathtracer;
+          } catch (err: any) {
+            console.error('[GPU] Failed to initialize renderer/pathtracer:', err);
+            setErrorLog(`WebGL initialization failed: ${err.message}`);
+            throw err; // Re-throw to be caught by outer try-catch
+          }
         }
         
         // Set scene background to black for proper lighting visibility
@@ -430,6 +571,11 @@ export default function WorkerNode() {
         // Add lights from GLTF metadata
         const lights = metadata.lights || [];
         console.log(`[GPU] Adding ${lights.length} lights from GLTF`);
+        
+        // Determine shadow map size based on device capabilities
+        const isMobileDevice = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+        const shadowMapSize = isMobileDevice ? 1024 : 4096; // Mobile: 1024, Desktop: 4096
+        console.log(`[GPU] Using shadow map size: ${shadowMapSize}x${shadowMapSize} (mobile: ${isMobileDevice})`);
         
         for (const lightDef of lights) {
           let light: THREE.Light;
@@ -443,8 +589,8 @@ export default function WorkerNode() {
             );
             light.position.set(lightDef.position.x, lightDef.position.y, lightDef.position.z);
             light.castShadow = true;
-            (light as THREE.PointLight).shadow.mapSize.width = 4096;
-            (light as THREE.PointLight).shadow.mapSize.height = 4096;
+            (light as THREE.PointLight).shadow.mapSize.width = shadowMapSize;
+            (light as THREE.PointLight).shadow.mapSize.height = shadowMapSize;
             (light as THREE.PointLight).shadow.bias = -0.0005;
             (light as THREE.PointLight).shadow.normalBias = 0.01;
             (light as THREE.PointLight).shadow.radius = 2; // Softer shadow edges
@@ -464,8 +610,8 @@ export default function WorkerNode() {
             (light as THREE.DirectionalLight).target.position.copy(targetPos);
             scene.add((light as THREE.DirectionalLight).target);
             light.castShadow = true;
-            (light as THREE.DirectionalLight).shadow.mapSize.width = 4096;
-            (light as THREE.DirectionalLight).shadow.mapSize.height = 4096;
+            (light as THREE.DirectionalLight).shadow.mapSize.width = shadowMapSize;
+            (light as THREE.DirectionalLight).shadow.mapSize.height = shadowMapSize;
             (light as THREE.DirectionalLight).shadow.bias = -0.0005;
             (light as THREE.DirectionalLight).shadow.normalBias = 0.01;
             (light as THREE.DirectionalLight).shadow.camera.near = 0.5;
@@ -493,8 +639,8 @@ export default function WorkerNode() {
             (light as THREE.SpotLight).target.position.copy(targetPos);
             scene.add((light as THREE.SpotLight).target);
             light.castShadow = true;
-            (light as THREE.SpotLight).shadow.mapSize.width = 4096;
-            (light as THREE.SpotLight).shadow.mapSize.height = 4096;
+            (light as THREE.SpotLight).shadow.mapSize.width = shadowMapSize;
+            (light as THREE.SpotLight).shadow.mapSize.height = shadowMapSize;
             (light as THREE.SpotLight).shadow.bias = -0.0005;
             (light as THREE.SpotLight).shadow.normalBias = 0.01;
             (light as THREE.SpotLight).shadow.focus = 1; // Better shadow focus
@@ -522,8 +668,8 @@ export default function WorkerNode() {
           const defaultLight = new THREE.PointLight(0xffffff, 100, 0);
           defaultLight.position.set(5, 5, 5);
           defaultLight.castShadow = true;
-          defaultLight.shadow.mapSize.width = 4096;
-          defaultLight.shadow.mapSize.height = 4096;
+          defaultLight.shadow.mapSize.width = shadowMapSize;
+          defaultLight.shadow.mapSize.height = shadowMapSize;
           defaultLight.shadow.bias = -0.0005;
           defaultLight.shadow.normalBias = 0.01;
           defaultLight.shadow.radius = 2; // Softer shadow edges
@@ -546,12 +692,20 @@ export default function WorkerNode() {
         setStatus(`GPU Pathtracer Ready. (${vertCount} verts, ${triCount} tris)`);
         console.log(`[GPU] pathtracer ready: ${vertCount} verts, ${triCount} tris`);
         
-        // RACE CONDITION RESOLVER: Did a task arrive while we were unpacking?
-        if (pendingTaskRef.current) {
-          setStatus(`Rendering queued tile [${pendingTaskRef.current.startX}, ${pendingTaskRef.current.startY}]...`);
-          const queued = pendingTaskRef.current;
-          pendingTaskRef.current = null;
-          await renderTile(queued);
+        // RACE CONDITION RESOLVER: Did tasks arrive while we were unpacking?
+        if (pendingTasksRef.current.length > 0) {
+          console.log(`[GPU] Processing ${pendingTasksRef.current.length} queued tile(s)...`);
+          const queued = [...pendingTasksRef.current];
+          pendingTasksRef.current = [];
+          for (const task of queued) {
+            setStatus(`Rendering queued tile [${task.startX}, ${task.startY}]...`);
+            await renderTile(task);
+            // tile_finished atomically returns worker to pool
+          }
+        } else {
+          // No pending tasks, signal we're ready for first task
+          console.log('[GPU] Emitting worker_ready (initial)');
+          socket.emit('worker_ready');
         }
 
       } catch (err: any) {
@@ -559,29 +713,87 @@ export default function WorkerNode() {
         setErrorLog(`Setup Error: ${err.message}`);
         setStatus('Error during setup.');
       }
+    };
+    
+    // Store function in ref so renderTile can access it
+    processGeometryRef.current = processGeometryUpdate;
+
+    // 3. THE UNPACKER — read pre-merged scene geometry from the binary buffer
+    socket.on('sync_geometry', async (payload) => {
+      if (!isMounted) return;
+      
+      // Don't process new geometry while rendering - queue it for later
+      if (isRenderingRef.current) {
+        console.warn('[sync_geometry] Worker is busy rendering, geometry update queued');
+        pendingGeometryRef.current = payload;
+        return;
+      }
+      
+      await processGeometryUpdate(payload);
     });
 
     // 4. RECEIVE A MICRO-CHUNK TASK
-    socket.on('assign_tile', async (task) => {
+    socket.on('assign_tile', async (task, acknowledgeFn) => {
       if (!isMounted) return;
       
+      console.log(`[Worker] Received assign_tile for (${task.startX},${task.startY})`);
+      
+      // ALWAYS acknowledge immediately to prevent server timeout
+      // Check if we can actually handle this tile
       if (!pathtracerRef.current || !geoCacheRef.current) {
-        console.warn("Race condition: Task arrived before geometry. Queuing it.");
-        setStatus('Task arrived early. Holding...');
-        pendingTaskRef.current = task;
+        console.warn("[Worker] Task arrived before geometry. Rejecting.");
+        console.warn(`[Worker] pathtracerRef: ${!!pathtracerRef.current}, geoCacheRef: ${!!geoCacheRef.current}`);
+        setStatus('Task arrived early. Rejecting...');
+        if (acknowledgeFn && typeof acknowledgeFn === 'function') {
+          acknowledgeFn({ status: 'rejected', reason: 'geometry_not_ready' });
+        }
+        return;
+      }
+      
+      // Check if already rendering - this is the key check
+      if (isRenderingRef.current) {
+        console.warn("[Worker] Worker is BUSY rendering. Rejecting tile.");
+        if (acknowledgeFn && typeof acknowledgeFn === 'function') {
+          acknowledgeFn({ status: 'rejected', reason: 'busy' });
+        }
         return;
       }
 
+      // Only acknowledge if we're actually going to render it
+      if (acknowledgeFn && typeof acknowledgeFn === 'function') {
+        console.log(`[Worker] Acknowledging tile assignment (${task.startX},${task.startY})`);
+        acknowledgeFn({ status: 'accepted', workerId: socket.id });
+      } else {
+        console.warn(`[Worker] No acknowledgeFn provided for tile (${task.startX},${task.startY})`);
+      }
+
+      console.log(`[Worker] Starting render for (${task.startX},${task.startY})`);
       setStatus(`Rendering tile [${task.startX}, ${task.startY}]...`);
-      await renderTile(task);
+      
+      try {
+        await renderTile(task);
+      } catch (err: any) {
+        console.error(`[Worker] Error rendering tile (${task.startX},${task.startY}):`, err);
+        setErrorLog(`Render error: ${err.message}`);
+        // Mark as not rendering so we can accept new tiles
+        isRenderingRef.current = false;
+        // Notify server we're ready again
+        socket.emit('worker_ready');
+      }
     });
 
     return () => {
       isMounted = false;
       socket.disconnect();
       
-      if (canvasRef.current && document.body.contains(canvasRef.current)) {
-        document.body.removeChild(canvasRef.current);
+      if (canvasRef.current) {
+        // Remove WebGL context loss handlers
+        canvasRef.current.removeEventListener('webglcontextlost', handleContextLost as EventListener);
+        canvasRef.current.removeEventListener('webglcontextrestored', handleContextRestored as EventListener);
+        
+        if (document.body.contains(canvasRef.current)) {
+          document.body.removeChild(canvasRef.current);
+        }
       }
       
       if (rendererRef.current) {
