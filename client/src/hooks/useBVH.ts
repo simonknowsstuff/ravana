@@ -1,6 +1,6 @@
 import * as THREE from 'three'
 import { MeshBVH, computeBoundsTree, disposeBoundsTree, acceleratedRaycast } from 'three-mesh-bvh'
-
+import renderConfig from '../config/renderConfig.json'
 // Add BVH methods to Three.js prototypes
 THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree
 THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree
@@ -168,7 +168,11 @@ export function buildFlatBVH(positions: Float32Array, indices: Uint32Array): Fla
 export function bakeMeshWithBVH(
   geometry: THREE.BufferGeometry,
   sceneRoot: THREE.Object3D,
-  options: BakeOptions = { samples: 64, maxDistance: 2.0, intensity: 1.0 }
+  options: BakeOptions = { 
+    samples: renderConfig.baking.samples, 
+    maxDistance: renderConfig.baking.maxDistance, 
+    intensity: renderConfig.baking.intensity 
+  }
 ): BakedData {
   // Build BVH for the geometry
   geometry.computeBoundsTree()

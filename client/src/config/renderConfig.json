@@ -1,0 +1,134 @@
+{
+  "render": {
+    "defaultResolution": {
+      "width": 1280,
+      "height": 720
+    },
+    "defaultSamples": 8,
+    "defaultTileSize": 64,
+    "maxSamples": 64,
+    "minSamples": 1,
+    "sampleStep": 1,
+    "minTileSize": 32,
+    "maxTileSize": 256,
+    "tileStep": 32,
+    "minResolution": 128,
+    "maxWidth": 7680,
+    "maxHeight": 4320,
+    "resolutionStep": 16,
+    "warningSamples": 16,
+    "warningPixels": 2073600,
+    "warningTileSize": 128
+  },
+  "lighting": {
+    "defaultExposure": 0,
+    "minExposure": -10,
+    "maxExposure": 10,
+    "exposureStep": 0.1,
+    "defaultLightScale": 0.5,
+    "minLightScale": 0.001,
+    "maxLightScale": 1,
+    "lightScaleStep": 0.001
+  },
+  "pathtracer": {
+    "bounces": 4,
+    "transmissiveBounces": 4,
+    "filterGlossyFactor": 0.5,
+    "dynamicLowRes": false,
+    "minSamples": 1,
+    "warningBounces": 8
+  },
+  "shadows": {
+    "enabled": true,
+    "mapSize": 1024,
+    "type": "BasicShadowMap",
+    "bias": -0.0005,
+    "normalBias": 0.01,
+    "radius": 2,
+    "cameraNear": 0.1,
+    "cameraFar": 100,
+    "warningMapSize": 2048
+  },
+  "baking": {
+    "samples": 32,
+    "maxDistance": 2.0,
+    "intensity": 1.0
+  },
+  "renderer": {
+    "antialias": false,
+    "antialiasOptions": [
+      { "name": "None", "value": false, "description": "No anti-aliasing, fastest" },
+      { "name": "MSAA", "value": true, "description": "Multi-sample anti-aliasing, smooth edges" }
+    ],
+    "toneMappingOptions": [
+      { "name": "None", "value": "NoToneMapping", "description": "No tone mapping" },
+      { "name": "Linear", "value": "LinearToneMapping", "description": "Simple linear mapping" },
+      { "name": "Reinhard", "value": "ReinhardToneMapping", "description": "Classic Reinhard tone mapping" },
+      { "name": "Cineon", "value": "CineonToneMapping", "description": "Film-like tone mapping" },
+      { "name": "ACES Filmic", "value": "ACESFilmicToneMapping", "description": "Industry standard (recommended)" }
+    ],
+    "shadowMapOptions": [
+      { "name": "Basic", "value": "BasicShadowMap", "description": "Fastest, sharp shadows" },
+      { "name": "PCF", "value": "PCFShadowMap", "description": "Percentage Closer Filtering, softer" },
+      { "name": "PCF Soft", "value": "PCFSoftShadowMap", "description": "Softest, slowest" }
+    ],
+    "powerPreference": "default",
+    "stencil": false,
+    "depth": true,
+    "failIfMajorPerformanceCaveat": false,
+    "outputColorSpace": "srgb",
+    "toneMapping": "ACESFilmic",
+    "toneMappingExposure": 1.0
+  },
+  "presets": {
+    "resolutions": [
+      { "name": "720p", "width": 1280, "height": 720 },
+      { "name": "1080p", "width": 1920, "height": 1080 },
+      { "name": "1440p", "width": 2560, "height": 1440 },
+      { "name": "4K", "width": 3840, "height": 2160 }
+    ],
+    "quality": [
+      {
+        "name": "Fast Preview",
+        "description": "Fast, noisy preview for testing",
+        "samples": 4,
+        "rayBounces": 2,
+        "shadowMapSize": 512,
+        "shadowMapType": "BasicShadowMap",
+        "antialias": false,
+        "toneMapping": "ACESFilmicToneMapping"
+      },
+      {
+        "name": "Mobile",
+        "description": "Decent quality for mobile devices",
+        "samples": 6,
+        "rayBounces": 3,
+        "shadowMapSize": 1024,
+        "shadowMapType": "BasicShadowMap",
+        "antialias": false,
+        "toneMapping": "ACESFilmicToneMapping"
+      },
+      {
+        "name": "Balanced",
+        "description": "Good quality, less noise",
+        "samples": 16,
+        "rayBounces": 6,
+        "shadowMapSize": 2048,
+        "shadowMapType": "PCFShadowMap",
+        "antialias": true,
+        "toneMapping": "ACESFilmicToneMapping"
+      },
+      {
+        "name": "High Quality",
+        "description": "Clean result with good indirect lighting",
+        "samples": 32,
+        "rayBounces": 8,
+        "shadowMapSize": 2048,
+        "shadowMapType": "PCFShadowMap",
+        "antialias": true,
+        "toneMapping": "ACESFilmicToneMapping"
+      }
+    ]
+  },
+  "description": "Mobile-optimized render settings for maximum device compatibility"
+}

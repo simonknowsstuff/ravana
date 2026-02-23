@@ -5,6 +5,7 @@ import GLBViewer, { CameraData } from './GLBViewer'
 import { GLBData, extractGLBData } from './hooks/useGLBData'
 import { useCanvasExporter } from './hooks'
 import { ScenePayload } from './types'
+import renderConfig from './config/renderConfig.json'
 
 // Compile scene data into a binary buffer for efficient transmission
 function compileSceneData(glbData: GLBData, cameraData: CameraData | null): { metadata: ScenePayload; buffer: ArrayBuffer } {
@@ -20,8 +21,9 @@ function compileSceneData(glbData: GLBData, cameraData: CameraData | null): { me
     const aoLength = mesh.bakedData?.ambientOcclusion.byteLength ?? 0
     const vertexColorsLength = mesh.bakedData?.vertexColors.byteLength ?? 0
     const bvhLength = mesh.bvhData?.byteLength ?? 0
+    const textureLength = mesh.texture ? mesh.texture.image.data.byteLength : 0
     
-    meshOffsets.push({
+    const textureOffset: ScenePayload['geometry']['meshes'][0] = {
       name: mesh.name,
       vertexCount: mesh.positions.length / 3,
       indexCount: mesh.indices?.length ?? 0,
@@ -29,6 +31,7 @@ function compileSceneData(glbData: GLBData, cameraData: CameraData | null): { me
       hasUvs: !!mesh.uvs,
       hasBakedData: !!mesh.bakedData,
       hasBvhData: !!mesh.bvhData,
+      hasTexture: !!mesh.texture,
       positionsOffset: totalBytes,
       positionsLength,
       normalsOffset: totalBytes + positionsLength,
@@ -43,9 +46,23 @@ function compileSceneData(glbData: GLBData, cameraData: CameraData | null): { me
       vertexColorsLength,
       bvhOffset: totalBytes + positionsLength + normalsLength + uvsLength + indicesLength + aoLength + vertexColorsLength,
       bvhLength,
-    })
+    }
     
-    totalBytes += positionsLength + normalsLength + uvsLength + indicesLength + aoLength + vertexColorsLength + bvhLength
+    // Add texture metadata if present
+    if (mesh.texture) {
+      textureOffset.textureWidth = mesh.texture.image.width
+      textureOffset.textureHeight = mesh.texture.image.height
+      textureOffset.textureOffset = totalBytes + positionsLength + normalsLength + uvsLength + indicesLength + aoLength + vertexColorsLength + bvhLength
+      textureOffset.textureLength = textureLength
+      textureOffset.textureWrapS = mesh.texture.wrapS
+      textureOffset.textureWrapT = mesh.texture.wrapT
+      textureOffset.textureMagFilter = mesh.texture.magFilter
+      textureOffset.textureMinFilter = mesh.texture.minFilter
+    }
+    
+    meshOffsets.push(textureOffset)
+    
+    totalBytes += positionsLength + normalsLength + uvsLength + indicesLength + aoLength + vertexColorsLength + bvhLength + textureLength
   }
   
   // Merged scene data offsets (appended after per-mesh data)
@@ -57,6 +74,7 @@ function compileSceneData(glbData: GLBData, cameraData: CameraData | null): { me
   const mergedNrmOff = mergedColOff + merged.colors.byteLength
   const mergedEmiOff = mergedNrmOff + merged.normals.byteLength
   const mergedAoOff = mergedEmiOff + merged.emissive.byteLength
+  const mergedUvsOff = mergedAoOff + merged.ambientOcclusion.byteLength
   const mergedMeta = {
     positionsOffset: mergedPosOff,
     positionsLength: merged.positions.byteLength,
@@ -72,8 +90,10 @@ function compileSceneData(glbData: GLBData, cameraData: CameraData | null): { me
     emissiveLength: merged.emissive.byteLength,
     aoOffset: mergedAoOff,
     aoLength: merged.ambientOcclusion.byteLength,
+    uvsOffset: mergedUvsOff,
+    uvsLength: merged.uvs.byteLength,
   }
-  totalBytes += merged.positions.byteLength + merged.indices.byteLength + merged.bvhData.byteLength + merged.colors.byteLength + merged.normals.byteLength + merged.emissive.byteLength + merged.ambientOcclusion.byteLength
+  totalBytes += merged.positions.byteLength + merged.indices.byteLength + merged.bvhData.byteLength + merged.colors.byteLength + merged.normals.byteLength + merged.emissive.byteLength + merged.ambientOcclusion.byteLength + merged.uvs.byteLength
   
   // Create the binary buffer
   const buffer = new ArrayBuffer(totalBytes)
@@ -118,6 +138,12 @@ function compileSceneData(glbData: GLBData, cameraData: CameraData | null): { me
       view.set(new Uint8Array(mesh.bvhData.buffer, mesh.bvhData.byteOffset, mesh.bvhData.byteLength), offset)
       offset += mesh.bvhData.byteLength
     }
+    
+    // Copy texture data
+    if (mesh.texture) {
+      view.set(new Uint8Array(mesh.texture.image.data.buffer), offset)
+      offset += mesh.texture.image.data.byteLength
+    }
   }
   
   // Copy merged scene data
@@ -135,6 +161,8 @@ function compileSceneData(glbData: GLBData, cameraData: CameraData | null): { me
   offset += merged.emissive.byteLength
   view.set(new Uint8Array(merged.ambientOcclusion.buffer, merged.ambientOcclusion.byteOffset, merged.ambientOcclusion.byteLength), offset)
   offset += merged.ambientOcclusion.byteLength
+  view.set(new Uint8Array(merged.uvs.buffer, merged.uvs.byteOffset, merged.uvs.byteLength), offset)
+  offset += merged.uvs.byteLength
   
   const metadata: ScenePayload = {
     timestamp: Date.now(),
@@ -171,16 +199,24 @@ function App() {
   const [currentFile, setCurrentFile] = useState<File | null>(null)
   const [savedCameraData, setSavedCameraData] = useState<CameraData | null>(null)
   const [showViewer, setShowViewer] = useState(true)
-  const [exposure, setExposure] = useState<number>(0)  // EV compensation: -10 to +10
-  const [lightScale, setLightScale] = useState<number>(0.01)  // Light intensity multiplier
+  const [exposure, setExposure] = useState<number>(renderConfig.lighting.defaultExposure)
+  const [lightScale, setLightScale] = useState<number>(renderConfig.lighting.defaultLightScale)
   const [networkIP, setNetworkIP] = useState<string | null>(null)
   
   // Render Settings Modal State
   const [showRenderSettings, setShowRenderSettings] = useState(false)
-  const [renderWidth, setRenderWidth] = useState<number>(1920)
-  const [renderHeight, setRenderHeight] = useState<number>(1080)
-  const [samples, setSamples] = useState<number>(16)
-  const [tileSize, setTileSize] = useState<number>(64)
+  const [renderWidth, setRenderWidth] = useState<number>(renderConfig.render.defaultResolution.width)
+  const [renderHeight, setRenderHeight] = useState<number>(renderConfig.render.defaultResolution.height)
+  const [samples, setSamples] = useState<number>(renderConfig.render.defaultSamples)
+  const [tileSize, setTileSize] = useState<number>(renderConfig.render.defaultTileSize)
+  
+  // Advanced Settings State
+  const [showAdvancedSettings, setShowAdvancedSettings] = useState(false)
+  const [antialias, setAntialias] = useState<boolean>(renderConfig.renderer.antialias)
+  const [toneMapping, setToneMapping] = useState<string>(renderConfig.renderer.toneMapping)
+  const [shadowMapType, setShadowMapType] = useState<string>(renderConfig.shadows.type)
+  const [shadowMapSize, setShadowMapSize] = useState<number>(renderConfig.shadows.mapSize)
+  const [rayBounces, setRayBounces] = useState<number>(renderConfig.pathtracer.bounces)
   
   // File input ref (to reset after clearing)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -231,6 +267,21 @@ function App() {
       URL.revokeObjectURL(url)
     }, mimeType, quality)
   }, [imageFormat, jpegQuality])
+
+  // Apply quality preset
+  const applyQualityPreset = useCallback((presetName: string) => {
+    const preset = renderConfig.presets.quality.find(p => p.name === presetName)
+    if (!preset) return
+    
+    setSamples(preset.samples)
+    setRayBounces(preset.rayBounces)
+    setShadowMapSize(preset.shadowMapSize)
+    setShadowMapType(preset.shadowMapType)
+    setAntialias(preset.antialias)
+    setToneMapping(preset.toneMapping)
+    
+    console.log(`[Quality Preset] Applied "${presetName}":`, preset)
+  }, [])
 
   // Initialize WebSocket connection
   // Fetch network IP address for QR code
@@ -476,19 +527,27 @@ function App() {
           samples: samples,  // Samples per pixel
         },
         lights: glbData.lights,
-        sunDir: { x: 0.5, y: 1.0, z: 0.5 }
+        sunDir: { x: 0.5, y: 1.0, z: 0.5 },
+        // Advanced settings
+        advancedSettings: {
+          antialias,
+          toneMapping,
+          shadowMapType,
+          shadowMapSize,
+          rayBounces
+        }
       })
       
       setLastSentPayload(metadata)
       console.log('[socket] sent scene payload:', metadata)
       console.log('[socket] binary buffer size:', buffer.byteLength, 'bytes')
-      console.log('[socket] render settings:', { renderWidth, renderHeight, samples, tileSize, exposure, lightScale })
+      console.log('[socket] render settings:', { renderWidth, renderHeight, samples, tileSize, exposure, lightScale, antialias, toneMapping, shadowMapType, shadowMapSize, rayBounces })
     } catch (error) {
       console.error('[socket] failed to send:', error)
     } finally {
       setIsSending(false)
     }
-  }, [glbData, savedCameraData, isConnected, exposure, lightScale, renderWidth, renderHeight, samples, tileSize])
+  }, [glbData, savedCameraData, isConnected, exposure, lightScale, renderWidth, renderHeight, samples, tileSize, antialias, toneMapping, shadowMapType, shadowMapSize, rayBounces])
 
   const handleFileUpload = useCallback(async (file: File) => {
     if (file && (file.name.endsWith('.gltf') || file.name.endsWith('.glb'))) {
@@ -743,17 +802,17 @@ function App() {
               </label>
               <input
                 type="range"
-                min="-10"
-                max="10"
-                step="0.1"
+                min={renderConfig.lighting.minExposure}
+                max={renderConfig.lighting.maxExposure}
+                step={renderConfig.lighting.exposureStep}
                 value={exposure}
                 onChange={(e) => setExposure(parseFloat(e.target.value))}
                 className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-purple-500"
               />
               <div className="flex justify-between text-xs text-slate-500 mt-1">
-                <span>-10 EV (darker)</span>
+                <span>{renderConfig.lighting.minExposure} EV (darker)</span>
                 <span>0</span>
-                <span>+10 EV (brighter)</span>
+                <span>+{renderConfig.lighting.maxExposure} EV (brighter)</span>
               </div>
               <p className="text-slate-400 text-sm mt-2">Adjust overall brightness (matches Blender's exposure setting)</p>
             </div>
@@ -765,17 +824,17 @@ function App() {
               </label>
               <input
                 type="range"
-                min="0.01"
-                max="1"
-                step="0.001"
+                min={renderConfig.lighting.minLightScale}
+                max={renderConfig.lighting.maxLightScale}
+                step={renderConfig.lighting.lightScaleStep}
                 value={lightScale}
                 onChange={(e) => setLightScale(parseFloat(e.target.value))}
                 className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
               />
               <div className="flex justify-between text-xs text-slate-500 mt-1">
-                <span>0.01x (very dim)</span>
+                <span>{renderConfig.lighting.minLightScale}x (very dim)</span>
                 <span>0.5x</span>
-                <span>1x (full)</span>
+                <span>{renderConfig.lighting.maxLightScale}x (full)</span>
               </div>
               <p className="text-slate-400 text-sm mt-2">Fine-tune light power from GLTF (start with lower values like 0.01-0.1)</p>
             </div>
@@ -1142,7 +1201,7 @@ function App() {
               </div>
 
               {/* Settings Grid */}
-              <div className="space-y-6">
+              <div className="space-y-6 max-h-[60vh] overflow-y-auto pr-4 -mr-2">
                 {/* Resolution Section */}
                 <div>
                   <h3 className="text-lg font-semibold text-cyan-400 mb-4">Resolution</h3>
@@ -1152,11 +1211,11 @@ function App() {
                       <input
                         type="number"
                         value={renderWidth}
-                        onChange={(e) => setRenderWidth(Math.max(128, parseInt(e.target.value) || 1920))}
+                        onChange={(e) => setRenderWidth(Math.max(renderConfig.render.minResolution, parseInt(e.target.value) || renderConfig.render.defaultResolution.width))}
                         className="w-full px-4 py-2 bg-slate-700 text-white rounded-lg focus:outline-none focus:ring-2 focus:ring-cyan-500"
-                        min="128"
-                        max="7680"
-                        step="16"
+                        min={renderConfig.render.minResolution}
+                        max={renderConfig.render.maxWidth}
+                        step={renderConfig.render.resolutionStep}
                       />
                     </div>
                     <div>
@@ -1164,19 +1223,33 @@ function App() {
                       <input
                         type="number"
                         value={renderHeight}
-                        onChange={(e) => setRenderHeight(Math.max(128, parseInt(e.target.value) || 1080))}
+                        onChange={(e) => setRenderHeight(Math.max(renderConfig.render.minResolution, parseInt(e.target.value) || renderConfig.render.defaultResolution.height))}
                         className="w-full px-4 py-2 bg-slate-700 text-white rounded-lg focus:outline-none focus:ring-2 focus:ring-cyan-500"
-                        min="128"
-                        max="4320"
-                        step="16"
+                        min={renderConfig.render.minResolution}
+                        max={renderConfig.render.maxHeight}
+                        step={renderConfig.render.resolutionStep}
                       />
                     </div>
                   </div>
                   <div className="flex gap-2 mt-3">
-                    <button onClick={() => { setRenderWidth(1920); setRenderHeight(1080); }} className="px-3 py-1 text-xs bg-slate-600 hover:bg-slate-500 text-white rounded transition-colors">1080p</button>
-                    <button onClick={() => { setRenderWidth(2560); setRenderHeight(1440); }} className="px-3 py-1 text-xs bg-slate-600 hover:bg-slate-500 text-white rounded transition-colors">1440p</button>
-                    <button onClick={() => { setRenderWidth(3840); setRenderHeight(2160); }} className="px-3 py-1 text-xs bg-slate-600 hover:bg-slate-500 text-white rounded transition-colors">4K</button>
+                    {renderConfig.presets.resolutions.map((preset) => (
+                      <button 
+                        key={preset.name}
+                        onClick={() => { setRenderWidth(preset.width); setRenderHeight(preset.height); }} 
+                        className="px-3 py-1 text-xs bg-slate-600 hover:bg-slate-500 text-white rounded transition-colors"
+                      >
+                        {preset.name}
+                      </button>
+                    ))}
                   </div>
+                  {(renderWidth * renderHeight) > renderConfig.render.warningPixels && (
+                    <div className="mt-3 text-xs text-yellow-400 flex items-start gap-1">
+                      <svg className="w-4 h-4 flex-shrink-0 mt-0.5" fill="currentColor" viewBox="0 0 20 20">
+                        <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
+                      </svg>
+                      <span>High resolution (over 1080p) will significantly increase render time</span>
+                    </div>
+                  )}
                 </div>
 
                 {/* Lighting Section */}
@@ -1192,14 +1265,14 @@ function App() {
                         value={exposure}
                         onChange={(e) => setExposure(parseFloat(e.target.value))}
                         className="w-full"
-                        min="-10"
-                        max="10"
-                        step="0.1"
+                        min={renderConfig.lighting.minExposure}
+                        max={renderConfig.lighting.maxExposure}
+                        step={renderConfig.lighting.exposureStep}
                       />
                       <div className="flex justify-between text-xs text-slate-500 mt-1">
-                        <span>-10</span>
+                        <span>{renderConfig.lighting.minExposure}</span>
                         <span>0</span>
-                        <span>+10</span>
+                        <span>+{renderConfig.lighting.maxExposure}</span>
                       </div>
                     </div>
                     <div>
@@ -1211,14 +1284,14 @@ function App() {
                         value={lightScale}
                         onChange={(e) => setLightScale(parseFloat(e.target.value))}
                         className="w-full"
-                        min="0.001"
-                        max="10"
-                        step="0.001"
+                        min={renderConfig.lighting.minLightScale}
+                        max={renderConfig.lighting.maxLightScale}
+                        step={renderConfig.lighting.lightScaleStep}
                       />
                       <div className="flex justify-between text-xs text-slate-500 mt-1">
-                        <span>0.001</span>
+                        <span>{renderConfig.lighting.minLightScale}</span>
                         <span>1.0</span>
-                        <span>10</span>
+                        <span>{renderConfig.lighting.maxLightScale}</span>
                       </div>
                     </div>
                   </div>
@@ -1237,15 +1310,23 @@ function App() {
                         value={samples}
                         onChange={(e) => setSamples(parseInt(e.target.value))}
                         className="w-full"
-                        min="1"
-                        max="128"
-                        step="1"
+                        min={renderConfig.render.minSamples}
+                        max={renderConfig.render.maxSamples}
+                        step={renderConfig.render.sampleStep}
                       />
                       <div className="flex justify-between text-xs text-slate-500 mt-1">
-                        <span>1 (Fast)</span>
-                        <span>64</span>
-                        <span>128 (Best)</span>
+                        <span>{renderConfig.render.minSamples} (Fast)</span>
+                        <span>{renderConfig.render.defaultSamples} (Balanced)</span>
+                        <span>{renderConfig.render.maxSamples} (Best)</span>
                       </div>
+                      {samples > renderConfig.render.warningSamples && (
+                        <div className="mt-2 text-xs text-yellow-400 flex items-start gap-1">
+                          <svg className="w-4 h-4 flex-shrink-0 mt-0.5" fill="currentColor" viewBox="0 0 20 20">
+                            <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
+                          </svg>
+                          <span>High sample count may cause very slow renders</span>
+                        </div>
+                      )}
                     </div>
                     <div>
                       <label className="block text-sm font-medium text-slate-300 mb-2">
@@ -1256,20 +1337,200 @@ function App() {
                         value={tileSize}
                         onChange={(e) => setTileSize(parseInt(e.target.value))}
                         className="w-full"
-                        min="32"
-                        max="256"
-                        step="32"
+                        min={renderConfig.render.minTileSize}
+                        max={renderConfig.render.maxTileSize}
+                        step={renderConfig.render.tileStep}
                       />
                       <div className="flex justify-between text-xs text-slate-500 mt-1">
-                        <span>32</span>
-                        <span>128</span>
-                        <span>256</span>
+                        <span>{renderConfig.render.minTileSize}</span>
+                        <span>{renderConfig.render.defaultTileSize}</span>
+                        <span>{renderConfig.render.maxTileSize}</span>
                       </div>
+                      {tileSize > renderConfig.render.warningTileSize && (
+                        <div className="mt-2 text-xs text-yellow-400 flex items-start gap-1">
+                          <svg className="w-4 h-4 flex-shrink-0 mt-0.5" fill="currentColor" viewBox="0 0 20 20">
+                            <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
+                          </svg>
+                          <span>Large tile sizes reduce distribution efficiency</span>
+                        </div>
+                      )}
                     </div>
                   </div>
                   <p className="text-xs text-slate-500 mt-3">
-                    Higher samples = better quality but slower render. Smaller tiles = better distribution but more overhead.
+                    {renderConfig.description}. Higher samples = better quality but slower. Smaller tiles = better distribution but more overhead.
                   </p>
+                </div>
+
+                {/* Quality Presets */}
+                <div className="bg-slate-700/50 rounded-lg p-4">
+                  <label className="block text-sm font-medium text-slate-300 mb-3">
+                    Quality Presets
+                  </label>
+                  <div className="grid grid-cols-2 gap-2">
+                    {renderConfig.presets.quality.map((preset) => (
+                      <button
+                        key={preset.name}
+                        onClick={() => applyQualityPreset(preset.name)}
+                        className="px-4 py-3 rounded-lg text-sm transition-colors bg-slate-600 text-slate-200 hover:bg-cyan-600 hover:text-white text-left"
+                        title={preset.description}
+                      >
+                        <div className="font-semibold">{preset.name}</div>
+                        <div className="text-xs text-slate-400 mt-1">{preset.description}</div>
+                      </button>
+                    ))}
+                  </div>
+                  <p className="text-xs text-slate-500 mt-3">
+                    Click a preset to quickly configure all quality settings. Start with "Mobile" for compatibility, use "Balanced" for most renders.
+                  </p>
+                </div>
+
+                {/* More Settings (Collapsible) */}
+                <div>
+                  <button
+                    onClick={() => setShowAdvancedSettings(!showAdvancedSettings)}
+                    className="w-full flex items-center justify-between text-cyan-400 hover:text-cyan-300 transition-colors mb-4"
+                  >
+                    <h3 className="text-lg font-semibold">More Settings</h3>
+                    <svg 
+                      className={`w-5 h-5 transform transition-transform ${showAdvancedSettings ? 'rotate-180' : ''}`}
+                      fill="none" 
+                      stroke="currentColor" 
+                      viewBox="0 0 24 24"
+                    >
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                    </svg>
+                  </button>
+                  
+                  {showAdvancedSettings && (
+                    <div className="space-y-4 bg-slate-700/30 rounded-lg p-4">
+                      {/* Anti-Aliasing */}
+                      <div>
+                        <label className="block text-sm font-medium text-slate-300 mb-2">
+                          Anti-Aliasing
+                        </label>
+                        <div className="grid grid-cols-2 gap-2">
+                          {renderConfig.renderer.antialiasOptions.map((option) => (
+                            <button
+                              key={option.name}
+                              onClick={() => setAntialias(option.value)}
+                              className={`px-3 py-2 rounded-lg text-sm transition-colors ${
+                                antialias === option.value
+                                  ? 'bg-cyan-500 text-white'
+                                  : 'bg-slate-600 text-slate-300 hover:bg-slate-500'
+                              }`}
+                              title={option.description}
+                            >
+                              {option.name}
+                            </button>
+                          ))}
+                        </div>
+                        <p className="text-xs text-slate-500 mt-1">
+                          {renderConfig.renderer.antialiasOptions.find(o => o.value === antialias)?.description}
+                        </p>
+                      </div>
+
+                      {/* Tone Mapping */}
+                      <div>
+                        <label className="block text-sm font-medium text-slate-300 mb-2">
+                          Tone Mapping
+                        </label>
+                        <select
+                          value={toneMapping}
+                          onChange={(e) => setToneMapping(e.target.value)}
+                          className="w-full px-3 py-2 bg-slate-600 text-white rounded-lg focus:outline-none focus:ring-2 focus:ring-cyan-500"
+                        >
+                          {renderConfig.renderer.toneMappingOptions.map((option) => (
+                            <option key={option.value} value={option.value}>
+                              {option.name}
+                            </option>
+                          ))}
+                        </select>
+                        <p className="text-xs text-slate-500 mt-1">
+                          {renderConfig.renderer.toneMappingOptions.find(o => o.value === toneMapping)?.description}
+                        </p>
+                      </div>
+
+                      {/* Shadow Settings */}
+                      <div className="grid grid-cols-2 gap-4">
+                        <div>
+                          <label className="block text-sm font-medium text-slate-300 mb-2">
+                            Shadow Quality
+                          </label>
+                          <select
+                            value={shadowMapType}
+                            onChange={(e) => setShadowMapType(e.target.value)}
+                            className="w-full px-3 py-2 bg-slate-600 text-white rounded-lg focus:outline-none focus:ring-2 focus:ring-cyan-500"
+                          >
+                            {renderConfig.renderer.shadowMapOptions.map((option) => (
+                              <option key={option.value} value={option.value}>
+                                {option.name}
+                              </option>
+                            ))}
+                          </select>
+                          <p className="text-xs text-slate-500 mt-1">
+                            {renderConfig.renderer.shadowMapOptions.find(o => o.value === shadowMapType)?.description}
+                          </p>
+                        </div>
+                        <div>
+                          <label className="block text-sm font-medium text-slate-300 mb-2">
+                            Shadow Resolution: {shadowMapSize}
+                          </label>
+                          <select
+                            value={shadowMapSize}
+                            onChange={(e) => setShadowMapSize(parseInt(e.target.value))}
+                            className="w-full px-3 py-2 bg-slate-600 text-white rounded-lg focus:outline-none focus:ring-2 focus:ring-cyan-500"
+                          >
+                            <option value="512">512 (Fast)</option>
+                            <option value="1024">1024 (Balanced)</option>
+                            <option value="2048">2048 (High)</option>
+                            <option value="4096">4096 (Ultra)</option>
+                            <option value="8192">8192 (Maximum)</option>
+                          </select>
+                          <p className="text-xs text-slate-500 mt-1">Higher = sharper shadows, slower render</p>
+                          {shadowMapSize > renderConfig.shadows.warningMapSize && (
+                            <div className="mt-2 text-xs text-yellow-400 flex items-start gap-1">
+                              <svg className="w-4 h-4 flex-shrink-0 mt-0.5" fill="currentColor" viewBox="0 0 20 20">
+                                <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
+                              </svg>
+                              <span>High shadow resolution may cause issues on mobile devices</span>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Ray Bounces */}
+                      <div>
+                        <label className="block text-sm font-medium text-slate-300 mb-2">
+                          Ray Bounces: {rayBounces}
+                        </label>
+                        <input
+                          type="range"
+                          value={rayBounces}
+                          onChange={(e) => setRayBounces(parseInt(e.target.value))}
+                          className="w-full"
+                          min="1"
+                          max="64"
+                          step="1"
+                        />
+                        <div className="flex justify-between text-xs text-slate-500 mt-1">
+                          <span>1 (Direct light only)</span>
+                          <span>8 (Balanced)</span>
+                          <span>64 (Maximum indirect)</span>
+                        </div>
+                        <p className="text-xs text-slate-500 mt-1">
+                          Controls indirect lighting and reflections. Higher = more realistic but slower.
+                        </p>
+                        {rayBounces > renderConfig.pathtracer.warningBounces && (
+                          <div className="mt-2 text-xs text-yellow-400 flex items-start gap-1">
+                            <svg className="w-4 h-4 flex-shrink-0 mt-0.5" fill="currentColor" viewBox="0 0 20 20">
+                              <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
+                            </svg>
+                            <span>High bounce count significantly increases render time</span>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
                 </div>
 
                 {/* Render Info */}

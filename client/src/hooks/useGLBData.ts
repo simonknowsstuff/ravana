@@ -3,6 +3,15 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js'
 import * as THREE from 'three'
 import { BakedData, BakeOptions, bakeMeshWithBVH, buildFlatBVH } from './useBVH'
+import renderConfig from '../config/renderConfig.json'
+
+export interface TextureData {
+  image: ImageData
+  wrapS: number
+  wrapT: number
+  magFilter: number
+  minFilter: number
+}
 
 export interface MeshData {
   name: string
@@ -12,6 +21,7 @@ export interface MeshData {
   indices: Uint32Array | null
   bakedData?: BakedData
   bvhData?: Float32Array // Serialized BVH tree for raytracing
+  texture?: TextureData | null // Base color texture
 }
 
 /** Scene-wide merged geometry for the raytracer (single BVH over all meshes) */
@@ -27,6 +37,8 @@ export interface MergedSceneData {
   emissive: Float32Array
   /** Per-vertex ambient occlusion [ao, ...] in 0-1 (modulates ambient lighting) */
   ambientOcclusion: Float32Array
+  /** Per-vertex UV coordinates [u,v, ...] in 0-1 for texture mapping */
+  uvs: Float32Array
 }
 
 /** A light extracted from the GLB scene */
@@ -64,9 +76,9 @@ export interface UseGLBDataReturn {
 }
 
 const defaultBakeOptions: BakeOptions = {
-  samples: 64,
-  maxDistance: 2.0,
-  intensity: 1.0
+  samples: renderConfig.baking.samples,
+  maxDistance: renderConfig.baking.maxDistance,
+  intensity: renderConfig.baking.intensity
 }
 
 /**
@@ -200,7 +212,35 @@ export async function extractGLBData(
         }
         meshWorldNormals.push(worldNormals)
 
-        const hasTexture = !!(mat?.map)
+        // Extract texture data if present
+        let textureData: TextureData | null = null
+        if (mat?.map && mat.map.image) {
+          try {
+            const texture = mat.map
+            // Create a canvas to extract pixel data from the texture
+            const canvas = document.createElement('canvas')
+            const img = texture.image
+            canvas.width = img.width
+            canvas.height = img.height
+            const ctx = canvas.getContext('2d')
+            if (ctx) {
+              ctx.drawImage(img, 0, 0)
+              const imageData = ctx.getImageData(0, 0, img.width, img.height)
+              textureData = {
+                image: imageData,
+                wrapS: texture.wrapS,
+                wrapT: texture.wrapT,
+                magFilter: texture.magFilter,
+                minFilter: texture.minFilter,
+              }
+              console.log(`[GLB] Extracted texture for "${child.name}": ${img.width}x${img.height}`)
+            }
+          } catch (err) {
+            console.warn(`[GLB] Failed to extract texture for "${child.name}":`, err)
+          }
+        }
+
+        const hasTexture = !!textureData
         console.log(`[GLB] mesh "${child.name}" | base(${linearBase.r.toFixed(3)},${linearBase.g.toFixed(3)},${linearBase.b.toFixed(3)}) emissive(${linearEmissive.r.toFixed(3)},${linearEmissive.g.toFixed(3)},${linearEmissive.b.toFixed(3)}) → sRGB(${srgbColor.r.toFixed(3)},${srgbColor.g.toFixed(3)},${srgbColor.b.toFixed(3)}) | vertexColors=${!!geoColors} texture=${hasTexture}`)
         
         // Build indices — generate them from vertex count if the geometry has none
@@ -228,6 +268,7 @@ export async function extractGLBData(
           indices: bvhIndices,
           bakedData,
           bvhData: bvhBuffer,
+          texture: textureData,
         }
         meshes.push(meshData)
         
@@ -332,7 +373,9 @@ export async function extractGLBData(
     const mergedEmissive = new Float32Array(totalPositionFloats)
     // Per-vertex ambient occlusion (1 float per vertex)
     const mergedAO = new Float32Array(totalPositionFloats / 3) // one AO value per vertex
-    let posOff = 0, idxOff = 0, vertBase = 0, aoOff = 0
+    // Per-vertex UVs (2 floats per vertex)
+    const mergedUVs = new Float32Array((totalPositionFloats / 3) * 2) // 2 floats per vertex
+    let posOff = 0, idxOff = 0, vertBase = 0, aoOff = 0, uvOff = 0
     
     for (let mi = 0; mi < meshes.length; mi++) {
       const m = meshes[mi]
@@ -368,6 +411,11 @@ export async function extractGLBData(
         mergedEmissive[posOff + vi * 3 + 2] = emissiveColor.b
         // Ambient Occlusion (per-vertex from baked data or 1.0 default)
         mergedAO[aoOff + vi] = bakedAO ? bakedAO[vi] : 1.0
+        // Copy UVs if available
+        if (m.uvs && m.uvs.length > vi * 2) {
+          mergedUVs[uvOff + vi * 2] = m.uvs[vi * 2]
+          mergedUVs[uvOff + vi * 2 + 1] = m.uvs[vi * 2 + 1]
+        }
       }
       if (m.indices) {
         for (let i = 0; i < m.indices.length; i++) {
@@ -377,6 +425,7 @@ export async function extractGLBData(
       }
       posOff += m.positions.length
       aoOff += vertCount
+      uvOff += vertCount * 2
       vertBase += vertCount
     }
     
@@ -390,6 +439,7 @@ export async function extractGLBData(
       normals: mergedNormals,
       emissive: mergedEmissive,
       ambientOcclusion: mergedAO,
+      uvs: mergedUVs,
     }
     
     const extractedTriCount = totalIndexUints / 3

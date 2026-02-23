@@ -18,3 +18,29 @@ body {
   width: 100%;
   min-height: 100vh;
 }
+
+/* Custom Scrollbar Styling */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #06b6d4 #1e293b;
+}
+
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+*::-webkit-scrollbar-track {
+  background: #1e293b;
+  border-radius: 4px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: #475569;
+  border-radius: 4px;
+  transition: background 0.2s;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: #06b6d4;
+}

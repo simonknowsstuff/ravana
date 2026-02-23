@@ -27,6 +27,7 @@ export interface ScenePayload {
       hasUvs: boolean
       hasBakedData: boolean
       hasBvhData: boolean
+      hasTexture: boolean
       // Byte offsets in the binary buffer
       positionsOffset: number
       positionsLength: number
@@ -42,6 +43,15 @@ export interface ScenePayload {
       vertexColorsLength: number
       bvhOffset: number
       bvhLength: number
+      // Texture metadata
+      textureWidth?: number
+      textureHeight?: number
+      textureOffset?: number
+      textureLength?: number
+      textureWrapS?: number
+      textureWrapT?: number
+      textureMagFilter?: number
+      textureMinFilter?: number
     }>
     /** Pre-merged scene geometry with a single BVH — byte offsets in the binary buffer */
     merged: {
@@ -57,6 +67,10 @@ export interface ScenePayload {
       normalsLength: number
       emissiveOffset: number
       emissiveLength: number
+      aoOffset: number
+      aoLength: number
+      uvsOffset: number
+      uvsLength: number
     }
   }
   /** Lights extracted from the GLB scene */

@@ -5,6 +5,8 @@ import {
   WebGLPathTracer, 
   PhysicalCamera
 } from 'three-gpu-pathtracer';
+import renderConfig from './config/renderConfig.json';
+import { renderTile as executeTileRender, AdvancedSettings } from './rendering/TileRenderer';
 
 interface GeometryCache {
   positions: Float32Array;
@@ -32,6 +34,12 @@ export default function WorkerNode() {
   const exposureRef = useRef<number>(0); // EV compensation
   const lightScaleRef = useRef<number>(1.0); // Light intensity multiplier
   
+  // Advanced settings refs (can be updated per render)
+  const toneMappingRef = useRef<string>('ACESFilmic');
+  const shadowMapTypeRef = useRef<string>('PCFShadowMap');
+  const shadowMapSizeRef = useRef<number>(4096);
+  const rayBouncesRef = useRef<number>(32);
+  
   // THE WAITING ROOM: Holds tasks if they arrive before geometry or while rendering
   const pendingTasksRef = useRef<any[]>([]);
   const isRenderingRef = useRef<boolean>(false);
@@ -50,209 +58,68 @@ export default function WorkerNode() {
     isRenderingRef.current = true;
     const renderGeometryVersion = geometryVersionRef.current;
 
-    const { startX, startY, width, height, canvasWidth, canvasHeight, camera: cameraData, samples: taskSamples, masterSocketId } = task;
+    const { masterSocketId } = task;
     
-    console.log(`[Render] Tile [${startX},${startY}] ${width}x${height} of ${canvasWidth}x${canvasHeight} with ${taskSamples || 16} samples`);
-    
-    // Update camera from task data - use FULL canvas aspect ratio
-    if (cameraData) {
-      if (cameraData.cameraPos) {
-        cameraRef.current.position.set(
-          cameraData.cameraPos.x,
-          cameraData.cameraPos.y,
-          cameraData.cameraPos.z
-        );
-      }
-      
-      // Update camera orientation from view matrix
-      if (cameraData.viewMatrix) {
-        const m = cameraData.viewMatrix;
-        cameraRef.current.matrixAutoUpdate = false;
-        cameraRef.current.matrix.fromArray(m);
-        cameraRef.current.matrixWorldNeedsUpdate = true;
-      }
-      
-      if (cameraData.fov) {
-        cameraRef.current.fov = cameraData.fov;
-      }
-      
-      // Extract exposure and lightScale from camera data
-      if (cameraData.exposure !== undefined) {
-        exposureRef.current = cameraData.exposure;
-      }
-      if (cameraData.lightScale !== undefined) {
-        lightScaleRef.current = cameraData.lightScale;
-      }
-    }
-    
-    // Use full canvas aspect ratio for proper perspective
-    cameraRef.current.aspect = canvasWidth / canvasHeight;
-    
-    // Adjust camera projection matrix to render only this tile region
-    // This shifts the view frustum to capture just this tile
-    const fullWidth = canvasWidth;
-    const fullHeight = canvasHeight;
-    
-    // Calculate the tile position as a fraction of the full canvas
-    // IMPORTANT: Flip Y coordinates because server uses Y=0 at top, OpenGL uses Y=0 at bottom
-    const tileLeft = startX / fullWidth;
-    const tileRight = (startX + width) / fullWidth;
-    const tileBottom = 1.0 - ((startY + height) / fullHeight); // Flipped
-    const tileTop = 1.0 - (startY / fullHeight); // Flipped
-    
-    // Manual projection matrix calculation for tile region
-    const fov = cameraRef.current.fov * (Math.PI / 180);
-    const aspect = fullWidth / fullHeight;
-    const near = cameraRef.current.near;
-    const far = cameraRef.current.far;
-    
-    const top = near * Math.tan(fov * 0.5);
-    const bottom = -top;
-    const right = top * aspect;
-    const left = -right;
-    
-    // Calculate tile-specific frustum
-    const tileLeftFrustum = left + (right - left) * tileLeft;
-    const tileRightFrustum = left + (right - left) * tileRight;
-    const tileBottomFrustum = bottom + (top - bottom) * tileBottom;
-    const tileTopFrustum = bottom + (top - bottom) * tileTop;
-    
-    // Set custom projection matrix for this tile
-    cameraRef.current.projectionMatrix.makePerspective(
-      tileLeftFrustum,
-      tileRightFrustum,
-      tileTopFrustum,
-      tileBottomFrustum,
-      near,
-      far
-    );
-    cameraRef.current.projectionMatrixInverse.copy(cameraRef.current.projectionMatrix).invert();
-    
-    // Set canvas/renderer to tile size
-    canvasRef.current.width = width;
-    canvasRef.current.height = height;
-    rendererRef.current.setSize(width, height, false);
-    
-    // Apply exposure to renderer (converts EV to linear scale)
-    const exposureScale = Math.pow(2, exposureRef.current);
-    rendererRef.current.toneMappingExposure = exposureScale;
-    
-    // Update light intensities based on lightScale
-    if (sceneRef.current) {
-      sceneRef.current.traverse((obj) => {
-        if (obj instanceof THREE.PointLight || obj instanceof THREE.DirectionalLight || obj instanceof THREE.SpotLight) {
-          // Scale light intensity (preserve base intensity stored in userData)
-          if (obj.userData.baseIntensity !== undefined) {
-            obj.intensity = obj.userData.baseIntensity * lightScaleRef.current;
-          }
-        } else if (obj instanceof THREE.AmbientLight) {
-          if (obj.userData.baseIntensity !== undefined) {
-            obj.intensity = obj.userData.baseIntensity * lightScaleRef.current;
-          }
-        }
-      });
-    }
-    
-    // Update pathtracer with scene and camera
-    pathtracerRef.current.setScene(sceneRef.current, cameraRef.current);
-    pathtracerRef.current.reset();
-    
-    // Render samples - use value from task or default to 16
-    const samples = taskSamples || 16;
-    for (let i = 0; i < samples; i++) {
-      pathtracerRef.current.renderSample();
-    }
-    
-    // Read tile pixels
-    const gl = rendererRef.current.getContext();
-    const pixels = new Uint8Array(width * height * 4);
+    // Prepare advanced settings object
+    const advancedSettings: AdvancedSettings = {
+      toneMapping: toneMappingRef.current,
+      shadowMapType: shadowMapTypeRef.current,
+      shadowMapSize: shadowMapSizeRef.current,
+      rayBounces: rayBouncesRef.current
+    };
     
     try {
-      // Check for WebGL errors before reading pixels
-      const preError = gl.getError();
-      if (preError !== gl.NO_ERROR) {
-        console.error(`[Render] WebGL error before readPixels: ${preError}`);
+      // Execute tile rendering using the extracted module
+      const result = await executeTileRender(
+        task,
+        canvasRef.current,
+        rendererRef.current,
+        pathtracerRef.current,
+        sceneRef.current,
+        cameraRef.current,
+        advancedSettings,
+        exposureRef,
+        lightScaleRef
+      );
+      
+      // Check if geometry was updated during render
+      if (renderGeometryVersion !== geometryVersionRef.current) {
+        console.warn(`[Render] Geometry changed during render (v${renderGeometryVersion} -> v${geometryVersionRef.current}), tile may be invalid`);
       }
       
-      gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+      // Mark as not rendering BEFORE sending tile_finished
+      isRenderingRef.current = false;
       
-      // Check if readPixels succeeded
-      const postError = gl.getError();
-      if (postError !== gl.NO_ERROR) {
-        console.error(`[Render] WebGL error during readPixels: ${postError}`);
-        console.error(`[Render] This is common on mobile devices with limited GPU memory`);
-        // Don't throw - let's try to send what we have
-      }
-      
-      // Verify we got valid data (check if all pixels are black/zero)
-      let nonZeroPixels = 0;
-      for (let i = 0; i < pixels.length; i += 4) {
-        if (pixels[i] !== 0 || pixels[i + 1] !== 0 || pixels[i + 2] !== 0) {
-          nonZeroPixels++;
-          if (nonZeroPixels > 10) break; // Early exit if we found some data
+      // Send result back to server with masterSocketId for proper routing
+      console.log(`[Render] Emitting tile_finished for (${result.startX},${result.startY})`);
+      socketRef.current.emit('tile_finished', {
+        buffer: result.pixels.buffer,
+        startX: result.startX,
+        startY: result.startY,
+        width: result.width,
+        height: result.height,
+        masterSocketId
+      }, (ack: any) => {
+        if (ack && ack.status === 'received') {
+          console.log(`[Render] Server acknowledged tile (${result.startX},${result.startY}), pool size: ${ack.poolSize}`);
+        } else if (ack && ack.status === 'error') {
+          console.error(`[Render] Server reported error for tile (${result.startX},${result.startY}): ${ack.error}`);
+        } else if (ack && ack.status === 'skipped') {
+          console.log(`[Render] Server skipped and requeued tile (${result.startX},${result.startY})`);
+        } else {
+          console.warn(`[Render] No acknowledgment from server for tile (${result.startX},${result.startY})`);
         }
-      }
-      
-      if (nonZeroPixels === 0) {
-        console.warn(`[Render] WARNING: All pixels are black!`);
-        console.warn(`[Render] Context state: isContextLost=${gl.isContextLost()}`);
-        console.warn(`[Render] This may indicate GPU memory issues or rendering failure`);
-      } else {
-        console.log(`[Render] Pixel data OK: ${nonZeroPixels}+ non-black pixels found`);
-      }
-    } catch (err: any) {
-      console.error(`[Render] Exception reading pixels:`, err);
-      // Continue with potentially black pixels rather than failing completely
-    }
-    
-    // Flip Y coordinate
-    const flippedPixels = new Uint8Array(width * height * 4);
-    for (let y = 0; y < height; y++) {
-      for (let x = 0; x < width; x++) {
-        const srcIdx = ((height - 1 - y) * width + x) * 4;
-        const dstIdx = (y * width + x) * 4;
-        flippedPixels[dstIdx] = pixels[srcIdx];
-        flippedPixels[dstIdx + 1] = pixels[srcIdx + 1];
-        flippedPixels[dstIdx + 2] = pixels[srcIdx + 2];
-        flippedPixels[dstIdx + 3] = pixels[srcIdx + 3];
-      }
-    }
-    
-    console.log(`[Render] Tile complete, sending...`);
-    
-    // Check if geometry was updated during render
-    if (renderGeometryVersion !== geometryVersionRef.current) {
-      console.warn(`[Render] Geometry changed during render (v${renderGeometryVersion} -> v${geometryVersionRef.current}), tile may be invalid`);
-    }
-    
-    // Mark as not rendering BEFORE sending tile_finished
-    // This ensures the worker can accept new tiles immediately
-    isRenderingRef.current = false;
-    
-    // Send result back to server with masterSocketId for proper routing
-    // Use acknowledgment to ensure server received the tile
-    console.log(`[Render] Emitting tile_finished for (${startX},${startY})`);
-    socketRef.current.emit('tile_finished', {
-      buffer: flippedPixels.buffer,
-      startX,
-      startY,
-      width,
-      height,
-      masterSocketId
-    }, (ack: any) => {
-      if (ack && ack.status === 'received') {
-        console.log(`[Render] Server acknowledged tile (${startX},${startY}), pool size: ${ack.poolSize}`);
-      } else if (ack && ack.status === 'error') {
-        console.error(`[Render] Server reported error for tile (${startX},${startY}): ${ack.error}`);
-      } else if (ack && ack.status === 'skipped') {
-        console.log(`[Render] Server skipped and requeued tile (${startX},${startY})`);
-      } else {
-        console.warn(`[Render] No acknowledgment from server for tile (${startX},${startY})`);
-      }
-    });
+      });
 
-    setTilesProcessed((prev) => prev + 1);
-    setStatus('Tile complete. Ready for next...');
+      setTilesProcessed((prev) => prev + 1);
+      setStatus('Tile complete. Ready for next...');
+      
+    } catch (err: any) {
+      console.error(`[Render] Exception during tile rendering:`, err);
+      isRenderingRef.current = false;
+      setErrorLog(`Rendering failed: ${err.message}`);
+      return;
+    }
     
     // If geometry update arrived while rendering, process it now
     if (pendingGeometryRef.current && processGeometryRef.current) {
@@ -263,7 +130,7 @@ export default function WorkerNode() {
       await processGeometryRef.current(pendingPayload);
     } else {
       // No pending geometry update - signal we're ready for next tile
-      console.log(`[Render] Emitting worker_ready after tile (${startX},${startY})`);
+      console.log(`[Render] Emitting worker_ready after tile`);
       if (socketRef.current) {
         socketRef.current.emit('worker_ready');
       }
@@ -369,6 +236,9 @@ export default function WorkerNode() {
         const ao = m.aoLength > 0
           ? new Float32Array(rawBuffer.slice(m.aoOffset, m.aoOffset + m.aoLength))
           : new Float32Array(0);
+        const uvs = m.uvsLength > 0
+          ? new Float32Array(rawBuffer.slice(m.uvsOffset, m.uvsOffset + m.uvsLength))
+          : new Float32Array(0);
 
         geoCacheRef.current = { positions, indices, bvhBuffer, colors, normals, emissive, ao };
         
@@ -394,6 +264,12 @@ export default function WorkerNode() {
         
         if (colors.length > 0) {
           geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+        }
+        
+        // Add UVs if available
+        if (uvs.length > 0) {
+          geometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+          console.log(`[GPU] Added ${uvs.length / 2} UV coordinates to geometry`);
         }
         
         // Add emissive as a vertex attribute if available
@@ -424,10 +300,51 @@ export default function WorkerNode() {
         
         console.log(`[GPU] Emissive analysis: ${emissiveVertexCount}/${totalVertices} vertices (${(emissiveRatio * 100).toFixed(1)}%), max: ${maxEmissive.toFixed(3)}`);
         
+        // Extract and create texture if available
+        let baseColorTexture: THREE.Texture | null = null;
+        // Check if any mesh has texture data
+        const meshWithTexture = metadata.geometry.meshes.find((mesh: any) => mesh.hasTexture);
+        if (meshWithTexture && meshWithTexture.textureOffset !== undefined && meshWithTexture.textureWidth && meshWithTexture.textureHeight) {
+          try {
+            console.log(`[GPU] Loading texture from mesh "${meshWithTexture.name}": ${meshWithTexture.textureWidth}x${meshWithTexture.textureHeight}`);
+            
+            // Extract texture data from buffer
+            const textureData = new Uint8ClampedArray(
+              rawBuffer.slice(meshWithTexture.textureOffset, meshWithTexture.textureOffset + meshWithTexture.textureLength!)
+            );
+            
+            // Create canvas and context to convert ImageData to texture
+            const canvas = document.createElement('canvas');
+            canvas.width = meshWithTexture.textureWidth;
+            canvas.height = meshWithTexture.textureHeight;
+            const ctx = canvas.getContext('2d');
+            
+            if (ctx) {
+              // Create ImageData from the raw texture data
+              const imageData = new ImageData(textureData, meshWithTexture.textureWidth, meshWithTexture.textureHeight);
+              ctx.putImageData(imageData, 0, 0);
+              
+              // Create Three.js texture from canvas
+              baseColorTexture = new THREE.CanvasTexture(canvas);
+              baseColorTexture.wrapS = meshWithTexture.textureWrapS || THREE.RepeatWrapping;
+              baseColorTexture.wrapT = meshWithTexture.textureWrapT || THREE.RepeatWrapping;
+              baseColorTexture.magFilter = meshWithTexture.textureMagFilter || THREE.LinearFilter;
+              baseColorTexture.minFilter = meshWithTexture.textureMinFilter || THREE.LinearMipmapLinearFilter;
+              baseColorTexture.colorSpace = THREE.SRGBColorSpace;
+              baseColorTexture.needsUpdate = true;
+              
+              console.log(`[GPU] Texture created successfully`);
+            }
+          } catch (err) {
+            console.error(`[GPU] Failed to create texture:`, err);
+          }
+        }
+        
         // Create material - use MeshPhysicalMaterial for better path tracing
         const material = new THREE.MeshPhysicalMaterial({
           color: 0xffffff,
-          vertexColors: colors.length > 0,
+          map: baseColorTexture, // Apply texture if available
+          vertexColors: colors.length > 0 && !baseColorTexture, // Use vertex colors only if no texture
           roughness: 0.7,
           metalness: 0.0,
           clearcoat: 0.0,
@@ -509,11 +426,11 @@ export default function WorkerNode() {
             
             const renderer = new THREE.WebGLRenderer({ 
               canvas: canvasRef.current,
-              antialias: false,
-              powerPreference: isMobileDevice ? 'default' : 'high-performance',
-              stencil: false,
-              depth: true,
-              failIfMajorPerformanceCaveat: false // Don't fail on slow devices
+              antialias: renderConfig.renderer.antialias,
+              powerPreference: isMobileDevice ? 'default' : renderConfig.renderer.powerPreference,
+              stencil: renderConfig.renderer.stencil,
+              depth: renderConfig.renderer.depth,
+              failIfMajorPerformanceCaveat: renderConfig.renderer.failIfMajorPerformanceCaveat
             });
             
             // Verify WebGL context was created
@@ -529,12 +446,12 @@ export default function WorkerNode() {
             
             renderer.outputColorSpace = THREE.SRGBColorSpace;
             renderer.toneMapping = THREE.ACESFilmicToneMapping;
-            renderer.toneMappingExposure = 1.0; // Will be updated per-render
+            renderer.toneMappingExposure = renderConfig.renderer.toneMappingExposure;
             
-            // Enable shadow rendering - use simpler shadows on mobile
-            renderer.shadowMap.enabled = true;
-            renderer.shadowMap.type = isMobileDevice ? THREE.BasicShadowMap : THREE.PCFShadowMap;
-            console.log(`[GPU] Shadow map type: ${isMobileDevice ? 'BasicShadowMap' : 'PCFShadowMap'}`);
+            // Enable shadow rendering - use config settings
+            renderer.shadowMap.enabled = renderConfig.shadows.enabled;
+            renderer.shadowMap.type = THREE.BasicShadowMap;
+            console.log(`[GPU] Shadow map type: ${renderConfig.shadows.type} (mobile-optimized)`);
             
             rendererRef.current = renderer;
             
@@ -542,20 +459,19 @@ export default function WorkerNode() {
             const pathtracer = new WebGLPathTracer(renderer);
             pathtracer.tiles.set(1, 1);
             
-            // Configure pathtracer - use lower settings on mobile
-            const bounces = isMobileDevice ? 4 : 8;
+            // Configure pathtracer with config settings
             // @ts-ignore - WebGLPathTracer properties
-            if (pathtracer.bounces !== undefined) pathtracer.bounces = bounces;
+            if (pathtracer.bounces !== undefined) pathtracer.bounces = renderConfig.pathtracer.bounces;
             // @ts-ignore
-            if (pathtracer.transmissiveBounces !== undefined) pathtracer.transmissiveBounces = bounces;
+            if (pathtracer.transmissiveBounces !== undefined) pathtracer.transmissiveBounces = renderConfig.pathtracer.transmissiveBounces;
             // @ts-ignore
-            if (pathtracer.filterGlossyFactor !== undefined) pathtracer.filterGlossyFactor = 0.5;
+            if (pathtracer.filterGlossyFactor !== undefined) pathtracer.filterGlossyFactor = renderConfig.pathtracer.filterGlossyFactor;
             // @ts-ignore
-            if (pathtracer.dynamicLowRes !== undefined) pathtracer.dynamicLowRes = false;
+            if (pathtracer.dynamicLowRes !== undefined) pathtracer.dynamicLowRes = renderConfig.pathtracer.dynamicLowRes;
             // @ts-ignore
-            if (pathtracer.minSamples !== undefined) pathtracer.minSamples = 1;
+            if (pathtracer.minSamples !== undefined) pathtracer.minSamples = renderConfig.pathtracer.minSamples;
             
-            console.log(`[GPU] Pathtracer configured with ${bounces} bounces`);
+            console.log(`[GPU] Pathtracer configured with ${renderConfig.pathtracer.bounces} bounces`);
             pathtracerRef.current = pathtracer;
           } catch (err: any) {
             console.error('[GPU] Failed to initialize renderer/pathtracer:', err);
@@ -572,10 +488,9 @@ export default function WorkerNode() {
         const lights = metadata.lights || [];
         console.log(`[GPU] Adding ${lights.length} lights from GLTF`);
         
-        // Determine shadow map size based on device capabilities
-        const isMobileDevice = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
-        const shadowMapSize = isMobileDevice ? 1024 : 4096; // Mobile: 1024, Desktop: 4096
-        console.log(`[GPU] Using shadow map size: ${shadowMapSize}x${shadowMapSize} (mobile: ${isMobileDevice})`);
+        // Use shadow map size from config
+        const shadowMapSize = renderConfig.shadows.mapSize;
+        console.log(`[GPU] Using shadow map size: ${shadowMapSize}x${shadowMapSize} (from config)`);
         
         for (const lightDef of lights) {
           let light: THREE.Light;
@@ -588,14 +503,14 @@ export default function WorkerNode() {
               lightDef.decay
             );
             light.position.set(lightDef.position.x, lightDef.position.y, lightDef.position.z);
-            light.castShadow = true;
+            light.castShadow = renderConfig.shadows.enabled;
             (light as THREE.PointLight).shadow.mapSize.width = shadowMapSize;
             (light as THREE.PointLight).shadow.mapSize.height = shadowMapSize;
-            (light as THREE.PointLight).shadow.bias = -0.0005;
-            (light as THREE.PointLight).shadow.normalBias = 0.01;
-            (light as THREE.PointLight).shadow.radius = 2; // Softer shadow edges
-            (light as THREE.PointLight).shadow.camera.near = 0.1;
-            (light as THREE.PointLight).shadow.camera.far = lightDef.distance > 0 ? lightDef.distance : 100;
+            (light as THREE.PointLight).shadow.bias = renderConfig.shadows.bias;
+            (light as THREE.PointLight).shadow.normalBias = renderConfig.shadows.normalBias;
+            (light as THREE.PointLight).shadow.radius = renderConfig.shadows.radius;
+            (light as THREE.PointLight).shadow.camera.near = renderConfig.shadows.cameraNear;
+            (light as THREE.PointLight).shadow.camera.far = lightDef.distance > 0 ? lightDef.distance : renderConfig.shadows.cameraFar;
           } else if (lightDef.type === 'directional') {
             light = new THREE.DirectionalLight(
               new THREE.Color(lightDef.color.r, lightDef.color.g, lightDef.color.b),
@@ -609,13 +524,13 @@ export default function WorkerNode() {
             );
             (light as THREE.DirectionalLight).target.position.copy(targetPos);
             scene.add((light as THREE.DirectionalLight).target);
-            light.castShadow = true;
+            light.castShadow = renderConfig.shadows.enabled;
             (light as THREE.DirectionalLight).shadow.mapSize.width = shadowMapSize;
             (light as THREE.DirectionalLight).shadow.mapSize.height = shadowMapSize;
-            (light as THREE.DirectionalLight).shadow.bias = -0.0005;
-            (light as THREE.DirectionalLight).shadow.normalBias = 0.01;
+            (light as THREE.DirectionalLight).shadow.bias = renderConfig.shadows.bias;
+            (light as THREE.DirectionalLight).shadow.normalBias = renderConfig.shadows.normalBias;
             (light as THREE.DirectionalLight).shadow.camera.near = 0.5;
-            (light as THREE.DirectionalLight).shadow.camera.far = 100;
+            (light as THREE.DirectionalLight).shadow.camera.far = renderConfig.shadows.cameraFar;
             // Adjust shadow camera frustum for better coverage
             (light as THREE.DirectionalLight).shadow.camera.left = -10;
             (light as THREE.DirectionalLight).shadow.camera.right = 10;
@@ -638,15 +553,15 @@ export default function WorkerNode() {
             );
             (light as THREE.SpotLight).target.position.copy(targetPos);
             scene.add((light as THREE.SpotLight).target);
-            light.castShadow = true;
+            light.castShadow = renderConfig.shadows.enabled;
             (light as THREE.SpotLight).shadow.mapSize.width = shadowMapSize;
             (light as THREE.SpotLight).shadow.mapSize.height = shadowMapSize;
-            (light as THREE.SpotLight).shadow.bias = -0.0005;
-            (light as THREE.SpotLight).shadow.normalBias = 0.01;
+            (light as THREE.SpotLight).shadow.bias = renderConfig.shadows.bias;
+            (light as THREE.SpotLight).shadow.normalBias = renderConfig.shadows.normalBias;
             (light as THREE.SpotLight).shadow.focus = 1; // Better shadow focus
-            (light as THREE.SpotLight).shadow.radius = 2; // Softer shadow edges
-            (light as THREE.SpotLight).shadow.camera.near = 0.1;
-            (light as THREE.SpotLight).shadow.camera.far = lightDef.distance > 0 ? lightDef.distance : 100;
+            (light as THREE.SpotLight).shadow.radius = renderConfig.shadows.radius;
+            (light as THREE.SpotLight).shadow.camera.near = renderConfig.shadows.cameraNear;
+            (light as THREE.SpotLight).shadow.camera.far = lightDef.distance > 0 ? lightDef.distance : renderConfig.shadows.cameraFar;
           } else {
             continue;
           }
@@ -667,14 +582,14 @@ export default function WorkerNode() {
           // Add a default point light
           const defaultLight = new THREE.PointLight(0xffffff, 100, 0);
           defaultLight.position.set(5, 5, 5);
-          defaultLight.castShadow = true;
+          defaultLight.castShadow = renderConfig.shadows.enabled;
           defaultLight.shadow.mapSize.width = shadowMapSize;
           defaultLight.shadow.mapSize.height = shadowMapSize;
-          defaultLight.shadow.bias = -0.0005;
-          defaultLight.shadow.normalBias = 0.01;
-          defaultLight.shadow.radius = 2; // Softer shadow edges
-          defaultLight.shadow.camera.near = 0.1;
-          defaultLight.shadow.camera.far = 100;
+          defaultLight.shadow.bias = renderConfig.shadows.bias;
+          defaultLight.shadow.normalBias = renderConfig.shadows.normalBias;
+          defaultLight.shadow.radius = renderConfig.shadows.radius;
+          defaultLight.shadow.camera.near = renderConfig.shadows.cameraNear;
+          defaultLight.shadow.camera.far = renderConfig.shadows.cameraFar;
           defaultLight.userData.baseIntensity = 100;
           scene.add(defaultLight);
         } else {
