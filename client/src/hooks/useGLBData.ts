@@ -4,6 +4,12 @@ import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js'
 import * as THREE from 'three'
 import { BakedData, BakeOptions, bakeMeshWithBVH, buildFlatBVH } from './useBVH'
 
+export interface TextureData {
+  pixels: Uint8Array
+  width: number
+  height: number
+}
+
 export interface MeshData {
   name: string
   positions: Float32Array
@@ -11,42 +17,41 @@ export interface MeshData {
   uvs: Float32Array | null
   indices: Uint32Array | null
   bakedData?: BakedData
-  bvhData?: Float32Array // Serialized BVH tree for raytracing
+  bvhData?: Float32Array
 }
 
-/** Scene-wide merged geometry for the raytracer (single BVH over all meshes) */
 export interface MergedSceneData {
   positions: Float32Array
   indices: Uint32Array
   bvhData: Float32Array
-  /** Per-vertex base-albedo RGB [r,g,b, ...] in 0-1 sRGB */
   colors: Float32Array
-  /** Per-vertex smooth normals [nx,ny,nz, ...] in world space */
   normals: Float32Array
-  /** Per-vertex emissive RGB [r,g,b, ...] in 0-1 sRGB (self-illumination, ignores lighting) */
   emissive: Float32Array
-  /** Per-vertex ambient occlusion [ao, ...] in 0-1 (modulates ambient lighting) */
   ambientOcclusion: Float32Array
+  uvs: Float32Array
+  textureIndices: Float32Array 
+  roughness: Float32Array
+  metallic: Float32Array
+  ormTextureIndices: Float32Array
+  emissiveTextureIndices: Float32Array // NEW
+  textures: TextureData[]
 }
 
-/** A light extracted from the GLB scene */
 export interface SceneLight {
   type: 'point' | 'directional' | 'spot'
-  position: { x: number; y: number; z: number }   // world space
-  direction: { x: number; y: number; z: number }   // for directional/spot
-  color: { r: number; g: number; b: number }        // sRGB 0-1
-  intensity: number                                  // candela / lux depending on type
-  distance: number                                   // 0 = infinite (directional)
-  decay: number                                      // attenuation exponent
-  angle: number                                      // spot cone angle (radians), 0 for others
-  penumbra: number                                   // spot penumbra 0-1
+  position: { x: number; y: number; z: number }
+  direction: { x: number; y: number; z: number }
+  color: { r: number; g: number; b: number }
+  intensity: number
+  distance: number
+  decay: number
+  angle: number
+  penumbra: number
 }
 
 export interface GLBData {
   meshes: MeshData[]
-  /** Merged scene geometry with a single BVH for raytrace workers */
   merged: MergedSceneData
-  /** Lights extracted from the GLB scene graph */
   lights: SceneLight[]
 }
 
@@ -69,17 +74,37 @@ const defaultBakeOptions: BakeOptions = {
   intensity: 1.0
 }
 
-/**
- * Extract mesh data from a GLB/GLTF file
- */
+function extractTextureData(texture: THREE.Texture): TextureData | null {
+  if (!texture || !texture.image) return null;
+  const image = texture.image;
+  const width = image.width;
+  const height = image.height;
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return null;
+
+  try {
+    if (texture.flipY) {
+      ctx.translate(0, height);
+      ctx.scale(1, -1);
+    }
+    ctx.drawImage(image, 0, 0, width, height);
+    const imageData = ctx.getImageData(0, 0, width, height);
+    return { pixels: new Uint8Array(imageData.data.buffer), width, height };
+  } catch (err) {
+    console.warn("Failed to extract texture pixels:", err);
+    return null;
+  }
+}
+
 export async function extractGLBData(
   file: File, 
   shouldBake: boolean = false,
   bakeOptions: BakeOptions = defaultBakeOptions
 ): Promise<GLBData> {
   const loader = new GLTFLoader()
-  
-  // Set up DRACO loader for compressed geometries
   const dracoLoader = new DRACOLoader()
   dracoLoader.setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.6/')
   loader.setDRACOLoader(dracoLoader)
@@ -89,38 +114,30 @@ export async function extractGLBData(
   try {
     const gltf = await loader.loadAsync(url)
     const meshes: MeshData[] = []
-    // Per-mesh material color (RGB 0-1) — needed for merged vertex colors
-    const meshColors: THREE.Color[] = []
-    // Per-mesh emissive colour (sRGB 0-1)
-    const meshEmissiveColors: THREE.Color[] = []
-    // Per-mesh: does this mesh have per-vertex colors in the geometry?
-    const meshVertexColors: (Float32Array | null)[] = []
-    // Per-mesh world-space normals (null if geometry had none → flat normals generated during merge)
-    const meshWorldNormals: (Float32Array | null)[] = []
     
-    // Ensure world matrices are computed so we get correct world-space positions
+    // Per-mesh tracking arrays
+    const meshColors: THREE.Color[] = []
+    const meshEmissiveColors: THREE.Color[] = []
+    const meshVertexColors: (Float32Array | null)[] = []
+    const meshWorldNormals: (Float32Array | null)[] = []
+    const meshUVs: (Float32Array | null)[] = []
+    
+    const meshRoughness: number[] = []
+    const meshMetallic: number[] = []
+    
+    const meshTextureIndices: number[] = []
+    const meshOrmIndices: number[] = []
+    const meshEmissiveIndices: number[] = [] // NEW
+    
+    const globalTextures: TextureData[] = []
+    const textureCache = new Map<THREE.Texture, number>()
+
     gltf.scene.updateMatrixWorld(true)
 
-    // Diagnostic: count original model polygons before any processing
-    let originalTriCount = 0
-    let originalMeshCount = 0
-    gltf.scene.traverse((child) => {
-      if (child instanceof THREE.Mesh) {
-        const geo = child.geometry as THREE.BufferGeometry
-        const posCount = geo.attributes.position?.count ?? 0
-        const idxCount = geo.index ? geo.index.count : posCount
-        originalTriCount += Math.floor(idxCount / 3)
-        originalMeshCount++
-      }
-    })
-    console.log(`[GLB] Original model: ${originalMeshCount} meshes, ${originalTriCount} triangles`)
-    
-    // Build BVH for all meshes first if baking
     if (shouldBake) {
       gltf.scene.traverse((child) => {
         if (child instanceof THREE.Mesh) {
-          const geometry = child.geometry as THREE.BufferGeometry
-          geometry.computeBoundsTree()
+          ;(child.geometry as THREE.BufferGeometry).computeBoundsTree()
         }
       })
     }
@@ -129,25 +146,17 @@ export async function extractGLBData(
       if (child instanceof THREE.Mesh) {
         const geometry = child.geometry as THREE.BufferGeometry
         
-        // Bake mesh data using BVH if requested
         let bakedData: BakedData | undefined
-        if (shouldBake) {
-          bakedData = bakeMeshWithBVH(geometry, gltf.scene, bakeOptions)
-        }
+        if (shouldBake) bakedData = bakeMeshWithBVH(geometry, gltf.scene, bakeOptions)
         
-        // Apply world transform so positions are in world space
         const positions = new Float32Array(geometry.attributes.position.array)
         const v = new THREE.Vector3()
         for (let i = 0; i < positions.length; i += 3) {
           v.set(positions[i], positions[i + 1], positions[i + 2])
           v.applyMatrix4(child.matrixWorld)
-          positions[i] = v.x
-          positions[i + 1] = v.y
-          positions[i + 2] = v.z
+          positions[i] = v.x; positions[i + 1] = v.y; positions[i + 2] = v.z;
         }
 
-        // Transform normals by the normal matrix (inverse transpose of upper 3×3)
-        // If no normals exist, compute flat face normals later during merge
         const normalMatrix = new THREE.Matrix3().getNormalMatrix(child.matrixWorld)
         let worldNormals: Float32Array | null = null
         if (geometry.attributes.normal) {
@@ -156,165 +165,108 @@ export async function extractGLBData(
           for (let i = 0; i < worldNormals.length; i += 3) {
             nv.set(worldNormals[i], worldNormals[i + 1], worldNormals[i + 2])
             nv.applyMatrix3(normalMatrix).normalize()
-            worldNormals[i] = nv.x
-            worldNormals[i + 1] = nv.y
-            worldNormals[i + 2] = nv.z
+            worldNormals[i] = nv.x; worldNormals[i + 1] = nv.y; worldNormals[i + 2] = nv.z;
           }
         }
         
-        // ── Collect ALL material colour sources ──────────────────
-        // Priority: geometry vertex colors > material properties
-        // For material: finalColor = baseColor + emissive * emissiveIntensity
         const mat = (Array.isArray(child.material) ? child.material[0] : child.material) as any
-
-        // 1. Base / diffuse color (linear)
+        
+        // Base Colors
         const linearBase = mat?.color ? mat.color.clone() : new THREE.Color(1, 1, 1)
-
-        // 2. Emissive colour (linear) + intensity — kept separate for self-illumination
         const linearEmissive = mat?.emissive ? mat.emissive.clone() : new THREE.Color(0, 0, 0)
-        const emissiveIntensity: number = mat?.emissiveIntensity ?? 1.0
-        linearEmissive.multiplyScalar(emissiveIntensity)
+        linearEmissive.multiplyScalar(mat?.emissiveIntensity ?? 1.0)
+        meshColors.push(new THREE.Color().copyLinearToSRGB(linearBase))
+        meshEmissiveColors.push(new THREE.Color().copyLinearToSRGB(linearEmissive))
 
-        // Convert base and emissive from linear → sRGB separately
-        const srgbColor = new THREE.Color().copyLinearToSRGB(linearBase)
-        meshColors.push(srgbColor)
-        const srgbEmissive = new THREE.Color().copyLinearToSRGB(linearEmissive)
-        meshEmissiveColors.push(srgbEmissive)
+        // PBR Base Properties
+        meshRoughness.push(mat?.roughness !== undefined ? mat.roughness : 0.5)
+        meshMetallic.push(mat?.metalness !== undefined ? mat.metalness : 0.0)
 
-        // 3. Per-vertex colors baked into geometry (already sRGB in most GLBs)
+        // Vertex Colors
         const geoColors = geometry.attributes.color
         if (geoColors) {
-          // color attribute can be RGB (itemSize 3) or RGBA (itemSize 4)
           const raw = geoColors.array as Float32Array
-          const stride = geoColors.itemSize  // 3 or 4
+          const stride = geoColors.itemSize
           const vertCount = positions.length / 3
           const vcolors = new Float32Array(vertCount * 3)
           for (let vi = 0; vi < vertCount; vi++) {
-            vcolors[vi * 3]     = raw[vi * stride]
-            vcolors[vi * 3 + 1] = raw[vi * stride + 1]
-            vcolors[vi * 3 + 2] = raw[vi * stride + 2]
+            vcolors[vi * 3] = raw[vi * stride]; vcolors[vi * 3 + 1] = raw[vi * stride + 1]; vcolors[vi * 3 + 2] = raw[vi * stride + 2];
           }
           meshVertexColors.push(vcolors)
         } else {
           meshVertexColors.push(null)
         }
         meshWorldNormals.push(worldNormals)
+        meshUVs.push(geometry.attributes.uv ? new Float32Array(geometry.attributes.uv.array) : null)
 
-        const hasTexture = !!(mat?.map)
-        console.log(`[GLB] mesh "${child.name}" | base(${linearBase.r.toFixed(3)},${linearBase.g.toFixed(3)},${linearBase.b.toFixed(3)}) emissive(${linearEmissive.r.toFixed(3)},${linearEmissive.g.toFixed(3)},${linearEmissive.b.toFixed(3)}) → sRGB(${srgbColor.r.toFixed(3)},${srgbColor.g.toFixed(3)},${srgbColor.b.toFixed(3)}) | vertexColors=${!!geoColors} texture=${hasTexture}`)
-        
-        // Build indices — generate them from vertex count if the geometry has none
+        // ── Texture Extraction Helper ──
+        const extractTex = (texObj: any) => {
+          if (!texObj) return -1;
+          if (textureCache.has(texObj)) return textureCache.get(texObj)!;
+          const texData = extractTextureData(texObj);
+          if (texData) {
+            const idx = globalTextures.length;
+            globalTextures.push(texData);
+            textureCache.set(texObj, idx);
+            return idx;
+          }
+          return -1;
+        }
+
+        // Extract All Maps
+        meshTextureIndices.push(extractTex(mat?.map))
+        meshOrmIndices.push(extractTex(mat?.metalnessMap || mat?.roughnessMap))
+        meshEmissiveIndices.push(extractTex(mat?.emissiveMap)) // NEW
+
         let rawIndices: Uint32Array
         if (geometry.index) {
           rawIndices = new Uint32Array(geometry.index.array)
         } else {
-          // Non-indexed geometry: create sequential indices
           const vertCount = positions.length / 3
           rawIndices = new Uint32Array(vertCount)
           for (let j = 0; j < vertCount; j++) rawIndices[j] = j
         }
         
-        // Build flat BVH in the format the raytracer worker expects.
-        // This also reorders indices to match the BVH leaf ordering.
         const { bvhBuffer, indices: bvhIndices } = buildFlatBVH(positions, rawIndices)
         
-        const meshData: MeshData = {
+        meshes.push({
           name: child.name || `mesh_${meshes.length}`,
-          positions,
-          normals: worldNormals,
-          uvs: geometry.attributes.uv 
-            ? new Float32Array(geometry.attributes.uv.array) 
-            : null,
-          indices: bvhIndices,
-          bakedData,
-          bvhData: bvhBuffer,
-        }
-        meshes.push(meshData)
+          positions, normals: worldNormals, uvs: meshUVs[meshUVs.length - 1],
+          indices: bvhIndices, bakedData, bvhData: bvhBuffer,
+        })
         
-        // Clean up BVH
-        if (geometry.boundsTree) {
-          geometry.disposeBoundsTree()
-        }
+        if (geometry.boundsTree) geometry.disposeBoundsTree()
       }
     })
     
-    // ── Extract lights from scene graph ─────────────────────
+    // Extract lights (Same as before)
     const lights: SceneLight[] = []
     gltf.scene.traverse((child) => {
       if (child instanceof THREE.PointLight) {
-        const wp = new THREE.Vector3()
-        child.getWorldPosition(wp)
-        const c = new THREE.Color().copyLinearToSRGB(child.color)
-        lights.push({
-          type: 'point',
-          position: { x: wp.x, y: wp.y, z: wp.z },
-          direction: { x: 0, y: -1, z: 0 },
-          color: { r: c.r, g: c.g, b: c.b },
-          intensity: child.intensity,
-          distance: child.distance,
-          decay: child.decay,
-          angle: 0,
-          penumbra: 0,
-        })
+        const wp = new THREE.Vector3(); child.getWorldPosition(wp); const c = new THREE.Color().copyLinearToSRGB(child.color);
+        lights.push({ type: 'point', position: { x: wp.x, y: wp.y, z: wp.z }, direction: { x: 0, y: -1, z: 0 }, color: { r: c.r, g: c.g, b: c.b }, intensity: child.intensity, distance: child.distance, decay: child.decay, angle: 0, penumbra: 0 })
       } else if (child instanceof THREE.DirectionalLight) {
-        const wp = new THREE.Vector3()
-        child.getWorldPosition(wp)
-        const td = new THREE.Vector3()
-        if (child.target) {
-          child.target.getWorldPosition(td)
-          td.sub(wp).normalize()
-        } else {
-          td.set(0, -1, 0)
-        }
-        const c = new THREE.Color().copyLinearToSRGB(child.color)
-        lights.push({
-          type: 'directional',
-          position: { x: wp.x, y: wp.y, z: wp.z },
-          direction: { x: td.x, y: td.y, z: td.z },
-          color: { r: c.r, g: c.g, b: c.b },
-          intensity: child.intensity,
-          distance: 0,
-          decay: 0,
-          angle: 0,
-          penumbra: 0,
-        })
+        const wp = new THREE.Vector3(); child.getWorldPosition(wp); const td = new THREE.Vector3();
+        if (child.target) { child.target.getWorldPosition(td); td.sub(wp).normalize(); } else { td.set(0, -1, 0); }
+        const c = new THREE.Color().copyLinearToSRGB(child.color);
+        lights.push({ type: 'directional', position: { x: wp.x, y: wp.y, z: wp.z }, direction: { x: td.x, y: td.y, z: td.z }, color: { r: c.r, g: c.g, b: c.b }, intensity: child.intensity, distance: 0, decay: 0, angle: 0, penumbra: 0 })
       } else if (child instanceof THREE.SpotLight) {
-        const wp = new THREE.Vector3()
-        child.getWorldPosition(wp)
-        const td = new THREE.Vector3()
-        if (child.target) {
-          child.target.getWorldPosition(td)
-          td.sub(wp).normalize()
-        } else {
-          td.set(0, -1, 0)
-        }
-        const c = new THREE.Color().copyLinearToSRGB(child.color)
-        lights.push({
-          type: 'spot',
-          position: { x: wp.x, y: wp.y, z: wp.z },
-          direction: { x: td.x, y: td.y, z: td.z },
-          color: { r: c.r, g: c.g, b: c.b },
-          intensity: child.intensity,
-          distance: child.distance,
-          decay: child.decay,
-          angle: child.angle,
-          penumbra: child.penumbra,
-        })
+        const wp = new THREE.Vector3(); child.getWorldPosition(wp); const td = new THREE.Vector3();
+        if (child.target) { child.target.getWorldPosition(td); td.sub(wp).normalize(); } else { td.set(0, -1, 0); }
+        const c = new THREE.Color().copyLinearToSRGB(child.color);
+        lights.push({ type: 'spot', position: { x: wp.x, y: wp.y, z: wp.z }, direction: { x: td.x, y: td.y, z: td.z }, color: { r: c.r, g: c.g, b: c.b }, intensity: child.intensity, distance: child.distance, decay: child.decay, angle: child.angle, penumbra: child.penumbra })
       }
     })
     
-    // If the GLB has no lights, add sensible defaults
     if (lights.length === 0) {
-      console.log('[GLB] No lights found in scene — adding default point lights')
       lights.push(
         { type: 'point', position: { x: 3, y: 5, z: 3 }, direction: { x: 0, y: -1, z: 0 }, color: { r: 1, g: 0.95, b: 0.9 }, intensity: 40, distance: 0, decay: 2, angle: 0, penumbra: 0 },
         { type: 'point', position: { x: -3, y: 4, z: -2 }, direction: { x: 0, y: -1, z: 0 }, color: { r: 0.7, g: 0.8, b: 1.0 }, intensity: 25, distance: 0, decay: 2, angle: 0, penumbra: 0 },
         { type: 'directional', position: { x: 0, y: 10, z: 0 }, direction: { x: 0.3, y: -1, z: 0.4 }, color: { r: 1, g: 1, b: 1 }, intensity: 1.0, distance: 0, decay: 0, angle: 0, penumbra: 0 },
       )
     }
-    console.log(`[GLB] extracted ${lights.length} lights:`, lights.map(l => `${l.type}(${l.intensity})`).join(', '))
     
-    // Build merged scene geometry: combine all positions + indices, build one BVH
+    // ── Build merged scene geometry ──
     let totalPositionFloats = 0
     let totalIndexUints = 0
     for (const m of meshes) {
@@ -324,121 +276,108 @@ export async function extractGLBData(
     
     const mergedPositions = new Float32Array(totalPositionFloats)
     const mergedIndices = new Uint32Array(totalIndexUints)
-    // Per-vertex RGB colors (3 floats per vertex)
-    const mergedColors = new Float32Array(totalPositionFloats) // same count as positions (3 per vert)
-    // Per-vertex smooth normals (3 floats per vertex)
+    const mergedColors = new Float32Array(totalPositionFloats) 
     const mergedNormals = new Float32Array(totalPositionFloats)
-    // Per-vertex emissive RGB (3 floats per vertex)
     const mergedEmissive = new Float32Array(totalPositionFloats)
-    // Per-vertex ambient occlusion (1 float per vertex)
-    const mergedAO = new Float32Array(totalPositionFloats / 3) // one AO value per vertex
-    let posOff = 0, idxOff = 0, vertBase = 0, aoOff = 0
+    const mergedAO = new Float32Array(totalPositionFloats / 3) 
+    const mergedUVs = new Float32Array((totalPositionFloats / 3) * 2) 
+    
+    // IMPORTANT: THESE MUST FILL WITH -1 SO NO TEXTURE IS INDEX 0!
+    const mergedTextureIndices = new Float32Array(totalPositionFloats / 3).fill(-1)
+    const mergedRoughness = new Float32Array(totalPositionFloats / 3)
+    const mergedMetallic = new Float32Array(totalPositionFloats / 3)
+    const mergedOrmTextureIndices = new Float32Array(totalPositionFloats / 3).fill(-1)
+    const mergedEmissiveTextureIndices = new Float32Array(totalPositionFloats / 3).fill(-1)
+
+    let posOff = 0, idxOff = 0, vertBase = 0, aoOff = 0, uvOff = 0
     
     for (let mi = 0; mi < meshes.length; mi++) {
       const m = meshes[mi]
-      const matColor = meshColors[mi] || new THREE.Color(0.8, 0.8, 0.8)
-      const emissiveColor = meshEmissiveColors[mi] || new THREE.Color(0, 0, 0)
-      const vcolors = meshVertexColors[mi] // per-vertex colors (sRGB) or null
-      const wnormals = meshWorldNormals[mi] // world-space normals or null
-      const bakedAO = m.bakedData?.ambientOcclusion || null
+      const matColor = meshColors[mi]; const emissiveColor = meshEmissiveColors[mi];
+      const vcolors = meshVertexColors[mi]; const wnormals = meshWorldNormals[mi];
+      const bakedAO = m.bakedData?.ambientOcclusion || null; const uvs = meshUVs[mi];
+      
+      const texIndex = meshTextureIndices[mi]
+      const baseRough = meshRoughness[mi]
+      const baseMetal = meshMetallic[mi]
+      const ormTexIdx = meshOrmIndices[mi]
+      const emiTexIdx = meshEmissiveIndices[mi]
+
       mergedPositions.set(m.positions, posOff)
-      // Fill per-vertex colors: prefer geometry vertex colors, fall back to material
+      
       const vertCount = m.positions.length / 3
       for (let vi = 0; vi < vertCount; vi++) {
         if (vcolors) {
-          // Geometry has per-vertex colours — use them directly
           mergedColors[posOff + vi * 3]     = vcolors[vi * 3]
           mergedColors[posOff + vi * 3 + 1] = vcolors[vi * 3 + 1]
           mergedColors[posOff + vi * 3 + 2] = vcolors[vi * 3 + 2]
         } else {
-          // Flat material colour for every vertex of this mesh
           mergedColors[posOff + vi * 3]     = matColor.r
           mergedColors[posOff + vi * 3 + 1] = matColor.g
           mergedColors[posOff + vi * 3 + 2] = matColor.b
         }
-        // Copy world-space normals (or zeros — raytracer will fall back to flat normal)
         if (wnormals) {
           mergedNormals[posOff + vi * 3]     = wnormals[vi * 3]
           mergedNormals[posOff + vi * 3 + 1] = wnormals[vi * 3 + 1]
           mergedNormals[posOff + vi * 3 + 2] = wnormals[vi * 3 + 2]
         }
-        // Emissive (flat per-mesh material emissive)
         mergedEmissive[posOff + vi * 3]     = emissiveColor.r
         mergedEmissive[posOff + vi * 3 + 1] = emissiveColor.g
         mergedEmissive[posOff + vi * 3 + 2] = emissiveColor.b
-        // Ambient Occlusion (per-vertex from baked data or 1.0 default)
         mergedAO[aoOff + vi] = bakedAO ? bakedAO[vi] : 1.0
+
+        if (uvs) {
+          mergedUVs[uvOff + vi * 2]     = uvs[vi * 2]
+          mergedUVs[uvOff + vi * 2 + 1] = uvs[vi * 2 + 1]
+        }
+        
+        mergedTextureIndices[aoOff + vi] = texIndex
+        mergedRoughness[aoOff + vi] = baseRough
+        mergedMetallic[aoOff + vi] = baseMetal
+        mergedOrmTextureIndices[aoOff + vi] = ormTexIdx
+        mergedEmissiveTextureIndices[aoOff + vi] = emiTexIdx
       }
       if (m.indices) {
-        for (let i = 0; i < m.indices.length; i++) {
-          mergedIndices[idxOff + i] = m.indices[i] + vertBase
-        }
+        for (let i = 0; i < m.indices.length; i++) mergedIndices[idxOff + i] = m.indices[i] + vertBase;
         idxOff += m.indices.length
       }
-      posOff += m.positions.length
-      aoOff += vertCount
-      vertBase += vertCount
+      posOff += m.positions.length; aoOff += vertCount; uvOff += vertCount * 2; vertBase += vertCount;
     }
     
     const { bvhBuffer, indices: bvhIndices } = buildFlatBVH(mergedPositions, mergedIndices)
     
     const merged: MergedSceneData = {
-      positions: mergedPositions,
-      indices: bvhIndices,
-      bvhData: bvhBuffer,
-      colors: mergedColors,
-      normals: mergedNormals,
-      emissive: mergedEmissive,
-      ambientOcclusion: mergedAO,
+      positions: mergedPositions, indices: bvhIndices, bvhData: bvhBuffer,
+      colors: mergedColors, normals: mergedNormals, emissive: mergedEmissive, ambientOcclusion: mergedAO,
+      uvs: mergedUVs, textureIndices: mergedTextureIndices, roughness: mergedRoughness, metallic: mergedMetallic,
+      ormTextureIndices: mergedOrmTextureIndices, emissiveTextureIndices: mergedEmissiveTextureIndices, textures: globalTextures
     }
-    
-    const extractedTriCount = totalIndexUints / 3
-    const retention = originalTriCount > 0 ? ((extractedTriCount / originalTriCount) * 100).toFixed(1) : '100'
-    console.log(`[GLB] merged scene: ${vertBase} verts, ${extractedTriCount} tris, ${bvhBuffer.length / 10} BVH nodes — ${retention}% of original ${originalTriCount} tris`)
-    
     return { meshes, merged, lights }
   } finally {
     URL.revokeObjectURL(url)
   }
 }
 
-/**
- * React hook for extracting GLB data with state management
- */
 export function useGLBData(options: UseGLBDataOptions = {}): UseGLBDataReturn {
   const { shouldBake = false, bakeOptions = defaultBakeOptions } = options
-  
   const [glbData, setGlbData] = useState<GLBData | null>(null)
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState<Error | null>(null)
 
   const extract = useCallback(async (file: File): Promise<GLBData> => {
-    setIsLoading(true)
-    setError(null)
-    
+    setIsLoading(true); setError(null);
     try {
       const data = await extractGLBData(file, shouldBake, bakeOptions)
       setGlbData(data)
       return data
     } catch (err) {
       const error = err instanceof Error ? err : new Error('Failed to extract GLB data')
-      setError(error)
-      throw error
+      setError(error); throw error;
     } finally {
       setIsLoading(false)
     }
   }, [shouldBake, bakeOptions])
 
-  const reset = useCallback(() => {
-    setGlbData(null)
-    setError(null)
-  }, [])
-
-  return {
-    glbData,
-    isLoading,
-    error,
-    extractGLBData: extract,
-    reset
-  }
+  const reset = useCallback(() => { setGlbData(null); setError(null); }, [])
+  return { glbData, isLoading, error, extractGLBData: extract, reset }
 }

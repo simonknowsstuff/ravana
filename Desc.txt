@@ -1,0 +1,3 @@
+Frontend deployed to: https://client-nu-henna-25.vercel.app/
+Worker nodes at: https://client-nu-henna-25.vercel.app/worker
+Backend run locally and tunneled to vercel env variables

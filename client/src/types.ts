@@ -1,19 +1,16 @@
-// Payload structure for websocket transmission
+// types.ts
 export interface ScenePayload {
   timestamp: number
   version: string
   camera: {
-    // Legacy position/rotation for debugging
     position: { x: number; y: number; z: number }
     target: { x: number; y: number; z: number }
-    // Camera parameters
     fov: number
     near: number
     far: number
-    // Matrices for ray tracing (column-major, 16 floats each)
-    viewMatrix: number[]        // World to view space
-    projectionMatrix: number[]  // View to clip space  
-    cameraMatrix: number[]      // Camera to world (for ray origin/direction)
+    viewMatrix: number[]
+    projectionMatrix: number[]
+    cameraMatrix: number[]
   } | null
   geometry: {
     meshCount: number
@@ -27,39 +24,40 @@ export interface ScenePayload {
       hasUvs: boolean
       hasBakedData: boolean
       hasBvhData: boolean
-      // Byte offsets in the binary buffer
-      positionsOffset: number
-      positionsLength: number
-      normalsOffset: number
-      normalsLength: number
-      uvsOffset: number
-      uvsLength: number
-      indicesOffset: number
-      indicesLength: number
-      aoOffset: number
-      aoLength: number
-      vertexColorsOffset: number
-      vertexColorsLength: number
-      bvhOffset: number
-      bvhLength: number
+      positionsOffset: number; positionsLength: number
+      normalsOffset: number; normalsLength: number
+      uvsOffset: number; uvsLength: number
+      indicesOffset: number; indicesLength: number
+      aoOffset: number; aoLength: number
+      vertexColorsOffset: number; vertexColorsLength: number
+      bvhOffset: number; bvhLength: number
     }>
-    /** Pre-merged scene geometry with a single BVH — byte offsets in the binary buffer */
+    // types.ts (Update the 'merged' object inside ScenePayload)
     merged: {
-      positionsOffset: number
-      positionsLength: number
-      indicesOffset: number
-      indicesLength: number
-      bvhOffset: number
-      bvhLength: number
-      colorsOffset: number
-      colorsLength: number
-      normalsOffset: number
-      normalsLength: number
-      emissiveOffset: number
-      emissiveLength: number
+      positionsOffset: number; positionsLength: number
+      indicesOffset: number; indicesLength: number
+      bvhOffset: number; bvhLength: number
+      colorsOffset: number; colorsLength: number
+      normalsOffset: number; normalsLength: number
+      emissiveOffset: number; emissiveLength: number
+      aoOffset: number; aoLength: number
+      uvsOffset: number; uvsLength: number
+      textureIndicesOffset: number; textureIndicesLength: number
+      // ── NEW PBR DATA ──
+      roughnessOffset: number; roughnessLength: number
+      metallicOffset: number; metallicLength: number
+      ormTextureIndicesOffset: number; ormTextureIndicesLength: number
+      emissiveTextureIndicesOffset: number; 
+      emissiveTextureIndicesLength: number;
+      
+      textures: Array<{
+        width: number
+        height: number
+        pixelsOffset: number
+        pixelsLength: number
+      }>
     }
   }
-  /** Lights extracted from the GLB scene */
   lights: Array<{
     type: 'point' | 'directional' | 'spot'
     position: { x: number; y: number; z: number }
