@@ -1,4 +1,3 @@
-// types.ts
 export interface ScenePayload {
   timestamp: number
   version: string
@@ -32,7 +31,6 @@ export interface ScenePayload {
       vertexColorsOffset: number; vertexColorsLength: number
       bvhOffset: number; bvhLength: number
     }>
-    // types.ts (Update the 'merged' object inside ScenePayload)
     merged: {
       positionsOffset: number; positionsLength: number
       indicesOffset: number; indicesLength: number
@@ -43,12 +41,17 @@ export interface ScenePayload {
       aoOffset: number; aoLength: number
       uvsOffset: number; uvsLength: number
       textureIndicesOffset: number; textureIndicesLength: number
-      // ── NEW PBR DATA ──
+      
       roughnessOffset: number; roughnessLength: number
       metallicOffset: number; metallicLength: number
       ormTextureIndicesOffset: number; ormTextureIndicesLength: number
-      emissiveTextureIndicesOffset: number; 
-      emissiveTextureIndicesLength: number;
+      emissiveTextureIndicesOffset: number; emissiveTextureIndicesLength: number
+      
+      transmissionOffset: number; transmissionLength: number
+      iorOffset: number; iorLength: number
+      // ── NEW VOLUME DATA ──
+      attenuationColorOffset: number; attenuationColorLength: number
+      attenuationDistanceOffset: number; attenuationDistanceLength: number
       
       textures: Array<{
         width: number

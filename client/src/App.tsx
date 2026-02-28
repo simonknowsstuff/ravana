@@ -6,9 +6,6 @@ import { useCanvasExporter } from './hooks'
 import { ScenePayload } from './types'
 
 // Compile scene data into a binary buffer for efficient transmission
-// App.tsx
-// Compile scene data into a binary buffer for efficient transmission
-// Compile scene data into a binary buffer for efficient transmission
 function compileSceneData(glbData: GLBData, cameraData: CameraData | null): { metadata: ScenePayload; buffer: ArrayBuffer } {
   let totalBytes = 0
   const meshOffsets: ScenePayload['geometry']['meshes'] = []
@@ -58,13 +55,20 @@ function compileSceneData(glbData: GLBData, cameraData: CameraData | null): { me
   const mergedUvOff = mergedAoOff + merged.ambientOcclusion.byteLength
   const mergedTexIdxOff = mergedUvOff + merged.uvs.byteLength
   
-  // ── NEW: PBR Mapping Offsets ──
+  // ── PBR Mapping Offsets ──
   const mergedRoughOff = mergedTexIdxOff + merged.textureIndices.byteLength
   const mergedMetalOff = mergedRoughOff + merged.roughness.byteLength
   const mergedOrmIdxOff = mergedMetalOff + merged.metallic.byteLength
-
   const mergedEmiTexIdxOff = mergedOrmIdxOff + merged.ormTextureIndices.byteLength;
-  let currentTexOffset = mergedEmiTexIdxOff + merged.emissiveTextureIndices.byteLength;
+
+  // ── GLASS & VOLUME OFFSETS ──
+  const mergedTransOff = mergedEmiTexIdxOff + merged.emissiveTextureIndices.byteLength;
+  const mergedIorOff = mergedTransOff + merged.transmission.byteLength;
+  
+  const mergedAttColorOff = mergedIorOff + merged.ior.byteLength;
+  const mergedAttDistOff = mergedAttColorOff + merged.attenuationColor.byteLength;
+  
+  let currentTexOffset = mergedAttDistOff + merged.attenuationDistance.byteLength;
   
   const textureMeta = (merged.textures || []).map((tex: any) => {
     const meta = {
@@ -77,7 +81,6 @@ function compileSceneData(glbData: GLBData, cameraData: CameraData | null): { me
     return meta
   })
 
-  // ── This is the object TypeScript was yelling about ──
   const mergedMeta = {
     positionsOffset: mergedPosOff, positionsLength: merged.positions.byteLength,
     indicesOffset: mergedIdxOff, indicesLength: merged.indices.byteLength,
@@ -88,13 +91,20 @@ function compileSceneData(glbData: GLBData, cameraData: CameraData | null): { me
     aoOffset: mergedAoOff, aoLength: merged.ambientOcclusion.byteLength,
     uvsOffset: mergedUvOff, uvsLength: merged.uvs.byteLength,
     textureIndicesOffset: mergedTexIdxOff, textureIndicesLength: merged.textureIndices.byteLength,
-    // ── NEW: Add the PBR lengths and offsets here ──
     roughnessOffset: mergedRoughOff, roughnessLength: merged.roughness.byteLength,
     metallicOffset: mergedMetalOff, metallicLength: merged.metallic.byteLength,
     ormTextureIndicesOffset: mergedOrmIdxOff, ormTextureIndicesLength: merged.ormTextureIndices.byteLength,
     textures: textureMeta,
     emissiveTextureIndicesOffset: mergedEmiTexIdxOff, 
     emissiveTextureIndicesLength: merged.emissiveTextureIndices.byteLength,
+    transmissionOffset: mergedTransOff,
+    transmissionLength: merged.transmission.byteLength,
+    iorOffset: mergedIorOff,
+    iorLength: merged.ior.byteLength,
+    attenuationColorOffset: mergedAttColorOff,
+    attenuationColorLength: merged.attenuationColor.byteLength,
+    attenuationDistanceOffset: mergedAttDistOff,
+    attenuationDistanceLength: merged.attenuationDistance.byteLength
   }
   
   // The final total size is exactly where the last texture pixel array ends
@@ -130,12 +140,15 @@ function compileSceneData(glbData: GLBData, cameraData: CameraData | null): { me
   // ── Copy UVs, Texture Indices, and PBR properties ──
   view.set(new Uint8Array(merged.uvs.buffer, merged.uvs.byteOffset, merged.uvs.byteLength), mergedUvOff)
   view.set(new Uint8Array(merged.textureIndices.buffer, merged.textureIndices.byteOffset, merged.textureIndices.byteLength), mergedTexIdxOff)
-  
-  // ── NEW: Write the actual PBR float arrays into the buffer ──
   view.set(new Uint8Array(merged.roughness.buffer, merged.roughness.byteOffset, merged.roughness.byteLength), mergedRoughOff)
   view.set(new Uint8Array(merged.metallic.buffer, merged.metallic.byteOffset, merged.metallic.byteLength), mergedMetalOff)
   view.set(new Uint8Array(merged.ormTextureIndices.buffer, merged.ormTextureIndices.byteOffset, merged.ormTextureIndices.byteLength), mergedOrmIdxOff)
   view.set(new Uint8Array(merged.emissiveTextureIndices.buffer, merged.emissiveTextureIndices.byteOffset, merged.emissiveTextureIndices.byteLength), mergedEmiTexIdxOff)
+  view.set(new Uint8Array(merged.transmission.buffer, merged.transmission.byteOffset, merged.transmission.byteLength), mergedTransOff)
+  view.set(new Uint8Array(merged.ior.buffer, merged.ior.byteOffset, merged.ior.byteLength), mergedIorOff)
+  view.set(new Uint8Array(merged.attenuationColor.buffer, merged.attenuationColor.byteOffset, merged.attenuationColor.byteLength), mergedAttColorOff)
+  view.set(new Uint8Array(merged.attenuationDistance.buffer, merged.attenuationDistance.byteOffset, merged.attenuationDistance.byteLength), mergedAttDistOff)
+  
   if (merged.textures) {
     for (let i = 0; i < merged.textures.length; i++) {
       const tex = merged.textures[i]
