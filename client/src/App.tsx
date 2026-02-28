@@ -277,7 +277,7 @@ function App() {
       })
 
       // 2. THE SPARK: Tell the server to create the queue and start the Swarm
-      const tileSize = 64
+      const tileSize = 32
       const cols = Math.ceil(RENDER_WIDTH / tileSize)
       const rows = Math.ceil(RENDER_HEIGHT / tileSize)
       setTotalTiles(cols * rows)

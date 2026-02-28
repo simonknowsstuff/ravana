@@ -188,230 +188,210 @@ self.onmessage = (event: MessageEvent<WorkerPayload | any>) => {
     return false;
   }
 
+
+
   const pixels = new Uint8ClampedArray(width * height * 4);
   const mainStack = new Uint32Array(64);
   let pixelIdx = 0;
 
+  // ── QUALITY SETTINGS ──
+  const SAMPLES_PER_PIXEL = 8; // 1 = Fast/Jagged, 4 = Smooth, 16 = AAA Cinematic
+  const SHADOW_SOFTNESS = 0.001; // 0.0 = Hard, 0.1 = Very Soft
+
   for (let y = startY; y < startY + height; y++) {
     for (let x = startX; x < startX + width; x++) {
-      const rd = getRayDirection(x, y, canvasWidth, canvasHeight, viewMatrix, fov);
-      let closestT = Infinity;
-      let hitNormal: Vector3 = { x: 0, y: 0, z: 0 };
-      let hitVertA = 0;
-      let hitU = 0, hitV = 0;
-      let hitA = 0, hitB = 0, hitC = 0;
+      
+      let pixelTotalR = 0, pixelTotalG = 0, pixelTotalB = 0;
 
-      let stackPtr = 0;
-      mainStack[stackPtr++] = 0;
-      let safety = 0;
-      while (stackPtr > 0) {
-        if (safety++ > 10000) break;
-        const nodeIdx = mainStack[--stackPtr];
-        const base = nodeIdx * BVH_NODE_SIZE;
-        if (!intersectBox(cameraPos, rd, bvhBuffer!, base)) continue;
-        const isLeaf = bvhBuffer![base + 9] !== 0;
-        if (isLeaf) {
-          const off = bvhBuffer![base + 7], cnt = bvhBuffer![base + 8];
-          for (let i = off; i < off + cnt; i++) {
-            const i3 = i * 3;
-            const aIdx = indices![i3] * 3, bIdx = indices![i3 + 1] * 3, cIdx = indices![i3 + 2] * 3;
-            const hit = intersectTriangleBary(
-              cameraPos, rd,
-              { x: positions![aIdx], y: positions![aIdx + 1], z: positions![aIdx + 2] },
-              { x: positions![bIdx], y: positions![bIdx + 1], z: positions![bIdx + 2] },
-              { x: positions![cIdx], y: positions![cIdx + 1], z: positions![cIdx + 2] }
-            );
-            if (hit !== null && hit.t < closestT) {
-              closestT = hit.t;
-              hitU = hit.u;
-              hitV = hit.v;
-              hitA = aIdx; hitB = bIdx; hitC = cIdx;
-              hitVertA = indices![i3];
-              hitNormal = calculateNormal(positions!, aIdx, bIdx, cIdx);
+      // ── MULTI-SAMPLING LOOP ──
+      for (let s = 0; s < SAMPLES_PER_PIXEL; s++) {
+        // 1. Anti-Aliasing: Jitter the camera ray inside the bounds of the pixel
+        const jx = x + Math.random();
+        const jy = y + Math.random();
+        const rd = getRayDirection(jx, jy, canvasWidth, canvasHeight, viewMatrix, fov);
+        
+        let closestT = Infinity;
+        let hitNormal: Vector3 = { x: 0, y: 0, z: 0 };
+        let hitVertA = 0;
+        let hitU = 0, hitV = 0;
+        let hitA = 0, hitB = 0, hitC = 0;
+
+        let stackPtr = 0;
+        mainStack[stackPtr++] = 0;
+        let safety = 0;
+        
+        // BVH Traversal
+        while (stackPtr > 0) {
+          if (safety++ > 10000) break;
+          const nodeIdx = mainStack[--stackPtr];
+          const base = nodeIdx * BVH_NODE_SIZE;
+          if (!intersectBox(cameraPos, rd, bvhBuffer!, base)) continue;
+          const isLeaf = bvhBuffer![base + 9] !== 0;
+          if (isLeaf) {
+            const off = bvhBuffer![base + 7], cnt = bvhBuffer![base + 8];
+            for (let i = off; i < off + cnt; i++) {
+              const i3 = i * 3;
+              const aIdx = indices![i3] * 3, bIdx = indices![i3 + 1] * 3, cIdx = indices![i3 + 2] * 3;
+              const hit = intersectTriangleBary(
+                cameraPos, rd,
+                { x: positions![aIdx], y: positions![aIdx + 1], z: positions![aIdx + 2] },
+                { x: positions![bIdx], y: positions![bIdx + 1], z: positions![bIdx + 2] },
+                { x: positions![cIdx], y: positions![cIdx + 1], z: positions![cIdx + 2] }
+              );
+              if (hit !== null && hit.t < closestT) {
+                closestT = hit.t;
+                hitU = hit.u; hitV = hit.v;
+                hitA = aIdx; hitB = bIdx; hitC = cIdx;
+                hitVertA = indices![i3];
+                hitNormal = calculateNormal(positions!, aIdx, bIdx, cIdx);
+              }
             }
-          }
-        } else {
-          mainStack[stackPtr++] = nodeIdx + 1;
-          mainStack[stackPtr++] = bvhBuffer![base + 6];
-        }
-      }
-
-      if (closestT < Infinity) {
-        const hitP: Vector3 = {
-          x: cameraPos.x + rd.x * closestT,
-          y: cameraPos.y + rd.y * closestT,
-          z: cameraPos.z + rd.z * closestT,
-        };
-
-        const w0 = 1 - hitU - hitV;
-        const w1 = hitU;
-        const w2 = hitV;
-
-        let shadingNormal = hitNormal;
-        if (normals && normals.length > 0) {
-          const nA: Vector3 = { x: normals[hitA], y: normals[hitA + 1], z: normals[hitA + 2] };
-          const nB: Vector3 = { x: normals[hitB], y: normals[hitB + 1], z: normals[hitB + 2] };
-          const nC: Vector3 = { x: normals[hitC], y: normals[hitC + 1], z: normals[hitC + 2] };
-          shadingNormal = normalize({
-            x: w0 * nA.x + w1 * nB.x + w2 * nC.x,
-            y: w0 * nA.y + w1 * nB.y + w2 * nC.y,
-            z: w0 * nA.z + w1 * nB.z + w2 * nC.z,
-          });
-        }
-
-        const geoN = dot(hitNormal, rd) > 0 ? { x: -hitNormal.x, y: -hitNormal.y, z: -hitNormal.z } : hitNormal;
-        const N = dot(shadingNormal, rd) > 0 ? { x: -shadingNormal.x, y: -shadingNormal.y, z: -shadingNormal.z } : shadingNormal;
-
-        const vertIndexA = hitA / 3;
-        let u = 0, v = 0;
-        
-        if (uvs && uvs.length > 0) {
-          const uvIdxA = vertIndexA * 2;
-          const uvIdxB = (hitB / 3) * 2;
-          const uvIdxC = (hitC / 3) * 2;
-          u = w0 * uvs[uvIdxA] + w1 * uvs[uvIdxB] + w2 * uvs[uvIdxC];
-          v = w0 * uvs[uvIdxA + 1] + w1 * uvs[uvIdxB + 1] + w2 * uvs[uvIdxC + 1];
-        }
-
-        // ── 1. Diffuse Color ──
-        let albR = 0.78, albG = 0.78, albB = 0.78;
-        const diffuseIdx = (textureIndices && textureIndices.length > 0) ? textureIndices[vertIndexA] : -1;
-        
-        if (diffuseIdx >= 0 && diffuseIdx < textures.length) {
-          const colorSample = sampleTextureBilinear(textures[diffuseIdx], u, v, true);
-          albR = colorSample.r; albG = colorSample.g; albB = colorSample.b;
-        } else if (colors && colors.length > 0) {
-          const ci = hitVertA * 3;
-          albR = colors[ci]; albG = colors[ci + 1]; albB = colors[ci + 2];
-        }
-
-        // ── 2. PBR Properties (ORM) ──
-        let roughness = (roughnessArray && roughnessArray.length > 0) ? roughnessArray[vertIndexA] : 0.5;
-        let metallic = (metallicArray && metallicArray.length > 0) ? metallicArray[vertIndexA] : 0.0;
-        let aoFactor = (ao && ao.length > 0) ? ao[hitVertA] : 1.0;
-        
-        const ormIdx = (ormTextureIndices && ormTextureIndices.length > 0) ? ormTextureIndices[vertIndexA] : -1;
-        if (ormIdx >= 0 && ormIdx < textures.length) {
-          // False = Do not gamma correct ORM data!
-          const ormSample = sampleTextureBilinear(textures[ormIdx], u, v, false);
-          
-          // GLTF ORM: R=AO, G=Roughness, B=Metallic
-          aoFactor *= ormSample.r; 
-          roughness *= ormSample.g;
-          metallic *= ormSample.b;
-        }
-        
-        // Clamp to physics-safe values
-        roughness = Math.max(0.04, Math.min(1.0, roughness));
-        metallic = Math.max(0.0, Math.min(1.0, metallic));
-        
-        // F0 is the base reflectivity.
-        const F0 = metallic > 0.5 ? { r: albR, g: albG, b: albB } : { r: 0.04, g: 0.04, b: 0.04 };
-
-        let totalR = 0, totalG = 0, totalB = 0;
-        const ambientStrength = 0.15 * aoFactor;
-        totalR += albR * ambientStrength;
-        totalG += albG * ambientStrength;
-        totalB += albB * ambientStrength;
-
-        // ── 3. Lighting Math ──
-        for (const light of lights) {
-          let L: Vector3, lightDist: number, attenuation = 1.0, spotFactor = 1.0;
-          if (light.type === 'directional') {
-            L = normalize({ x: -light.direction.x, y: -light.direction.y, z: -light.direction.z });
-            lightDist = 1e6;
-            // Directional lights shouldn't be insanely bright in our simple model
-            attenuation = Math.min(light.intensity, 3.0); 
           } else {
-            const toLight = sub(light.position, hitP);
-            lightDist = Math.sqrt(dot(toLight, toLight));
-            L = { x: toLight.x / lightDist, y: toLight.y / lightDist, z: toLight.z / lightDist };
-            
-            // Standard inverse-square falloff, clamped to prevent blowing out when light is very close to surface
-            const distanceSquare = Math.max(0.1, dot(toLight, toLight));
-            attenuation = light.distance > 0 && lightDist > light.distance ? 0 : light.intensity / distanceSquare;
-            
-            if (light.type === 'spot') {
-              const cosAngle = -dot(L, normalize(light.direction));
-              const cosCone = Math.cos(light.angle), cosPenumbra = Math.cos(light.angle * (1 - light.penumbra));
-              spotFactor = cosAngle < cosCone ? 0 : cosAngle < cosPenumbra ? Math.pow((cosAngle - cosCone) / (cosPenumbra - cosCone), 2) : 1;
+            mainStack[stackPtr++] = nodeIdx + 1;
+            mainStack[stackPtr++] = bvhBuffer![base + 6];
+          }
+        }
+
+        if (closestT < Infinity) {
+          const hitP: Vector3 = {
+            x: cameraPos.x + rd.x * closestT,
+            y: cameraPos.y + rd.y * closestT,
+            z: cameraPos.z + rd.z * closestT,
+          };
+
+          const w0 = 1 - hitU - hitV; const w1 = hitU; const w2 = hitV;
+
+          let shadingNormal = hitNormal;
+          if (normals && normals.length > 0) {
+            const nA: Vector3 = { x: normals[hitA], y: normals[hitA + 1], z: normals[hitA + 2] };
+            const nB: Vector3 = { x: normals[hitB], y: normals[hitB + 1], z: normals[hitB + 2] };
+            const nC: Vector3 = { x: normals[hitC], y: normals[hitC + 1], z: normals[hitC + 2] };
+            shadingNormal = normalize({
+              x: w0 * nA.x + w1 * nB.x + w2 * nC.x,
+              y: w0 * nA.y + w1 * nB.y + w2 * nC.y,
+              z: w0 * nA.z + w1 * nB.z + w2 * nC.z,
+            });
+          }
+
+          const geoN = dot(hitNormal, rd) > 0 ? { x: -hitNormal.x, y: -hitNormal.y, z: -hitNormal.z } : hitNormal;
+          const N = dot(shadingNormal, rd) > 0 ? { x: -shadingNormal.x, y: -shadingNormal.y, z: -shadingNormal.z } : shadingNormal;
+
+          const vertIndexA = hitA / 3;
+          let u = 0, v = 0;
+          
+          if (uvs && uvs.length > 0) {
+            const uvIdxA = vertIndexA * 2, uvIdxB = (hitB / 3) * 2, uvIdxC = (hitC / 3) * 2;
+            u = w0 * uvs[uvIdxA] + w1 * uvs[uvIdxB] + w2 * uvs[uvIdxC];
+            v = w0 * uvs[uvIdxA + 1] + w1 * uvs[uvIdxB + 1] + w2 * uvs[uvIdxC + 1];
+          }
+
+          // Diffuse
+          let albR = 0.78, albG = 0.78, albB = 0.78;
+          const diffuseIdx = (textureIndices && textureIndices.length > 0) ? textureIndices[vertIndexA] : -1;
+          if (diffuseIdx >= 0 && diffuseIdx < textures.length) {
+            const colorSample = sampleTextureBilinear(textures[diffuseIdx], u, v, true);
+            albR = colorSample.r; albG = colorSample.g; albB = colorSample.b;
+          } else if (colors && colors.length > 0) {
+            const ci = hitVertA * 3; albR = colors[ci]; albG = colors[ci + 1]; albB = colors[ci + 2];
+          }
+
+          // PBR
+          let roughness = (roughnessArray && roughnessArray.length > 0) ? roughnessArray[vertIndexA] : 0.5;
+          let metallic = (metallicArray && metallicArray.length > 0) ? metallicArray[vertIndexA] : 0.0;
+          let aoFactor = (ao && ao.length > 0) ? ao[hitVertA] : 1.0;
+          
+          const ormIdx = (ormTextureIndices && ormTextureIndices.length > 0) ? ormTextureIndices[vertIndexA] : -1;
+          if (ormIdx >= 0 && ormIdx < textures.length) {
+            const ormSample = sampleTextureBilinear(textures[ormIdx], u, v, false);
+            aoFactor *= ormSample.r; roughness *= ormSample.g; metallic *= ormSample.b;
+          }
+          
+          roughness = Math.max(0.04, Math.min(1.0, roughness));
+          metallic = Math.max(0.0, Math.min(1.0, metallic));
+          const F0 = metallic > 0.5 ? { r: albR, g: albG, b: albB } : { r: 0.04, g: 0.04, b: 0.04 };
+
+          let sampleR = 0, sampleG = 0, sampleB = 0;
+          const ambientStrength = 0.15 * aoFactor;
+          sampleR += albR * ambientStrength; sampleG += albG * ambientStrength; sampleB += albB * ambientStrength;
+
+          for (const light of lights) {
+            let L: Vector3, lightDist: number, attenuation = 1.0, spotFactor = 1.0;
+            if (light.type === 'directional') {
+              L = normalize({ x: -light.direction.x, y: -light.direction.y, z: -light.direction.z });
+              lightDist = 1e6; attenuation = Math.min(light.intensity, 3.0); 
+            } else {
+              const toLight = sub(light.position, hitP);
+              lightDist = Math.sqrt(dot(toLight, toLight));
+              L = { x: toLight.x / lightDist, y: toLight.y / lightDist, z: toLight.z / lightDist };
+              const distanceSquare = Math.max(0.1, dot(toLight, toLight));
+              attenuation = light.distance > 0 && lightDist > light.distance ? 0 : light.intensity / distanceSquare;
             }
+            if (attenuation * spotFactor < 0.001) continue;
+            const NdotL = Math.max(0, dot(N, L));
+            if (NdotL <= 0) continue;
+            
+            // 2. Soft Shadows: Jitter the Light Vector
+            const jitteredL = normalize({
+              x: L.x + (Math.random() - 0.5) * SHADOW_SOFTNESS,
+              y: L.y + (Math.random() - 0.5) * SHADOW_SOFTNESS,
+              z: L.z + (Math.random() - 0.5) * SHADOW_SOFTNESS
+            });
+
+            // Cast the shadow ray using the jittered light direction
+            if (isOccluded({ x: hitP.x + geoN.x * SHADOW_EPSILON, y: hitP.y + geoN.y * SHADOW_EPSILON, z: hitP.z + geoN.z * SHADOW_EPSILON }, jitteredL, lightDist)) continue;
+
+            const V = normalize(sub(cameraPos, hitP));
+            const H = normalize({ x: L.x + V.x, y: L.y + V.y, z: L.z + V.z });
+            const NdotH = Math.max(0.001, dot(N, H)); const VdotH = Math.max(0.001, dot(V, H)); const NdotV = Math.max(0.001, dot(N, V));
+            
+            const safeRoughness = Math.max(0.08, roughness); 
+            const alpha2 = Math.pow(safeRoughness * safeRoughness, 2);
+            const D = alpha2 / (Math.pow(NdotH * NdotH * (alpha2 - 1.0) + 1.0, 2) * Math.PI);
+            const fresnel = (a: number) => a + (1.0 - a) * Math.pow(Math.max(0, 1.0 - VdotH), 5.0);
+            const F = { r: fresnel(F0.r), g: fresnel(F0.g), b: fresnel(F0.b) };
+            const k = Math.pow(safeRoughness + 1.0, 2) / 8.0;
+            const G = 1.0 / (NdotV * (1.0 - k) + k) / (NdotL * (1.0 - k) + k);
+            
+            const denominator = Math.max(0.001, 4.0 * NdotV * NdotL);
+            let specBrdfR = Math.min(10.0, (D * F.r * G) / denominator); let specBrdfG = Math.min(10.0, (D * F.g * G) / denominator); let specBrdfB = Math.min(10.0, (D * F.b * G) / denominator);
+            const kD_r = (1.0 - F.r) * (1.0 - metallic); const kD_g = (1.0 - F.g) * (1.0 - metallic); const kD_b = (1.0 - F.b) * (1.0 - metallic);
+            const radiance = attenuation * spotFactor * NdotL;
+
+            sampleR += ((albR * kD_r) / Math.PI + specBrdfR) * light.color.r * radiance;
+            sampleG += ((albG * kD_g) / Math.PI + specBrdfG) * light.color.g * radiance;
+            sampleB += ((albB * kD_b) / Math.PI + specBrdfB) * light.color.b * radiance;
           }
-          if (attenuation * spotFactor < 0.001) continue;
-          
-          const NdotL = Math.max(0, dot(N, L));
-          if (NdotL <= 0) continue;
-          
-          // Shadow Ray
-          if (isOccluded({ x: hitP.x + geoN.x * SHADOW_EPSILON, y: hitP.y + geoN.y * SHADOW_EPSILON, z: hitP.z + geoN.z * SHADOW_EPSILON }, L, lightDist)) continue;
 
-          const V = normalize(sub(cameraPos, hitP));
-          const H = normalize({ x: L.x + V.x, y: L.y + V.y, z: L.z + V.z });
-          
-          const NdotH = Math.max(0.001, dot(N, H));
-          const VdotH = Math.max(0.001, dot(V, H));
-          const NdotV = Math.max(0.001, dot(N, V));
-          
-          // GGX Specular - clamped roughness to prevent divide-by-zero explosions
-          const safeRoughness = Math.max(0.08, roughness); 
-          const alpha2 = Math.pow(safeRoughness * safeRoughness, 2);
-          const D = alpha2 / (Math.pow(NdotH * NdotH * (alpha2 - 1.0) + 1.0, 2) * Math.PI);
-          
-          const fresnel = (a: number) => a + (1.0 - a) * Math.pow(Math.max(0, 1.0 - VdotH), 5.0);
-          const F = { r: fresnel(F0.r), g: fresnel(F0.g), b: fresnel(F0.b) };
-          
-          const k = Math.pow(safeRoughness + 1.0, 2) / 8.0;
-          const G = 1.0 / (NdotV * (1.0 - k) + k) / (NdotL * (1.0 - k) + k);
-          
-          // Calculate specular with a safety clamp to prevent infinite spikes
-          const denominator = Math.max(0.001, 4.0 * NdotV * NdotL);
-          let specBrdfR = Math.min(10.0, (D * F.r * G) / denominator);
-          let specBrdfG = Math.min(10.0, (D * F.g * G) / denominator);
-          let specBrdfB = Math.min(10.0, (D * F.b * G) / denominator);
-
-          // Energy conservation: diffuse light is whatever light WASN'T reflected as specular
-          const kD_r = (1.0 - F.r) * (1.0 - metallic);
-          const kD_g = (1.0 - F.g) * (1.0 - metallic);
-          const kD_b = (1.0 - F.b) * (1.0 - metallic);
-
-          // Combine Diffuse and Specular, multiply by light intensity and angle
-          const radiance = attenuation * spotFactor * NdotL;
-
-          totalR += ((albR * kD_r) / Math.PI + specBrdfR) * light.color.r * radiance;
-          totalG += ((albG * kD_g) / Math.PI + specBrdfG) * light.color.g * radiance;
-          totalB += ((albB * kD_b) / Math.PI + specBrdfB) * light.color.b * radiance;
-        }
-
-        // ── 4. Emissive Texture (The Glowing Blue Visor!) ──
-        let emiR = 0, emiG = 0, emiB = 0;
-        const emiIdx = (emissiveTextureIndices && emissiveTextureIndices.length > 0) ? emissiveTextureIndices[vertIndexA] : -1;
-        
-        if (emiIdx >= 0 && emiIdx < textures.length) {
-          // Sample the glowing texture (sRGB = true)
-          const emiSample = sampleTextureBilinear(textures[emiIdx], u, v, true);
-          emiR = emiSample.r; emiG = emiSample.g; emiB = emiSample.b;
-        } else if (emissive && emissive.length > 0) {
-          // Fallback to flat material glow
-          const ei = hitVertA * 3;
-          if (ei + 2 < emissive.length) {
-            emiR = emissive[ei]; emiG = emissive[ei + 1]; emiB = emissive[ei + 2];
+          // Emissive
+          let emiR = 0, emiG = 0, emiB = 0;
+          const emiIdx = (emissiveTextureIndices && emissiveTextureIndices.length > 0) ? emissiveTextureIndices[vertIndexA] : -1;
+          if (emiIdx >= 0 && emiIdx < textures.length) {
+            const emiSample = sampleTextureBilinear(textures[emiIdx], u, v, true);
+            emiR = emiSample.r; emiG = emiSample.g; emiB = emiSample.b;
+          } else if (emissive && emissive.length > 0) {
+            const ei = hitVertA * 3;
+            if (ei + 2 < emissive.length) { emiR = emissive[ei]; emiG = emissive[ei + 1]; emiB = emissive[ei + 2]; }
           }
+          sampleR += emiR * 5.0; sampleG += emiG * 5.0; sampleB += emiB * 5.0;
+
+          pixelTotalR += sampleR; pixelTotalG += sampleG; pixelTotalB += sampleB;
+        } else {
+          // Background Color
+          pixelTotalR += 18/255; pixelTotalG += 18/255; pixelTotalB += 20/255; 
         }
+      } // -- END MULTI-SAMPLE LOOP --
 
-        // Add the glow to the final pixel color (independent of external lighting)
-        totalR += emiR * 5.0;
-        totalG += emiG * 5.0;
-        totalB += emiB * 5.0;
+      // 3. Average the samples
+      pixelTotalR /= SAMPLES_PER_PIXEL;
+      pixelTotalG /= SAMPLES_PER_PIXEL;
+      pixelTotalB /= SAMPLES_PER_PIXEL;
 
-        // ACES Tone mapping & Gamma Correction
-        const aces = (v: number) => (v * (2.51 * v + 0.03)) / (v * (2.43 * v + 0.59) + 0.14);
-        pixels[pixelIdx++] = Math.min(255, Math.max(0, Math.round(Math.pow(aces(totalR), 1 / 2.2) * 255)));
-        pixels[pixelIdx++] = Math.min(255, Math.max(0, Math.round(Math.pow(aces(totalG), 1 / 2.2) * 255)));
-        pixels[pixelIdx++] = Math.min(255, Math.max(0, Math.round(Math.pow(aces(totalB), 1 / 2.2) * 255)));
-        pixels[pixelIdx++] = 255;
-      } else {
-        pixels[pixelIdx++] = 18; pixels[pixelIdx++] = 18; pixels[pixelIdx++] = 20; pixels[pixelIdx++] = 255;
-      }
+      // ACES Tone mapping & Gamma Correction
+      const aces = (v: number) => (v * (2.51 * v + 0.03)) / (v * (2.43 * v + 0.59) + 0.14);
+      pixels[pixelIdx++] = Math.min(255, Math.max(0, Math.round(Math.pow(aces(pixelTotalR), 1 / 2.2) * 255)));
+      pixels[pixelIdx++] = Math.min(255, Math.max(0, Math.round(Math.pow(aces(pixelTotalG), 1 / 2.2) * 255)));
+      pixels[pixelIdx++] = Math.min(255, Math.max(0, Math.round(Math.pow(aces(pixelTotalB), 1 / 2.2) * 255)));
+      pixels[pixelIdx++] = 255;
     }
   }
   self.postMessage({ buffer: pixels.buffer, startX, startY, width, height }, [pixels.buffer] as any);
