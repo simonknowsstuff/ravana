@@ -307,6 +307,8 @@ function App() {
   // Update elapsed time during rendering
   useEffect(() => {
     if (!isRendering || renderStartTime === null) return
+    // Stop timer when all tiles received
+    if (totalTiles > 0 && tilesReceived >= totalTiles) return
 
     const updateElapsed = () => {
       const elapsed = Date.now() - renderStartTime
@@ -323,7 +325,7 @@ function App() {
     updateElapsed()
     const interval = setInterval(updateElapsed, 1000)
     return () => clearInterval(interval)
-  }, [isRendering, renderStartTime])
+  }, [isRendering, renderStartTime, tilesReceived, totalTiles])
 
   // Retry countdown timer
   useEffect(() => {
