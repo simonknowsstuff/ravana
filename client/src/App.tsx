@@ -592,10 +592,7 @@ function App() {
       {/* Content wrapper - takes remaining space above footer */}
       <div className="flex-1 flex flex-col">
         {/* Header */}
-        <header className="p-6 border-b border-white/10 bg-slate-800 relative z-10 flex items-center justify-between">
-          {/* Invisible spacer to keep title centered */}
-          <div className="w-32 hidden md:block"></div>
-          
+        <header className="p-6 border-b border-white/10 bg-slate-800 relative z-10 flex items-center justify-center">
           <div>
             <h1 className="text-4xl font-bold text-white text-center">
               Ravana
@@ -603,18 +600,6 @@ function App() {
             <p className="text-slate-400 text-center mt-2">
               Zero-install, browser-based compute farm.
             </p>
-          </div>
-
-          {/* THE QR CODE FOR THE JUDGES */}
-          <div className="bg-slate-900/80 p-3 rounded-xl border border-cyan-500/30 shadow-lg shadow-cyan-500/10 flex flex-col items-center transform transition-transform hover:scale-105">
-            <span className="text-xs font-bold text-cyan-400 mb-2 uppercase tracking-widest animate-pulse">
-              Scan to Join Swarm
-            </span>
-            <img 
-              src={`https://api.qrserver.com/v1/create-qr-code/?size=120x120&data=${encodeURIComponent(window.location.origin + '/worker')}&margin=0`} 
-              alt="Join Worker Node" 
-              className="w-24 h-24 rounded bg-white p-1"
-            />
           </div>
         </header>
         <main className="container mx-auto p-6 pb-30 relative z-10 flex-1">
