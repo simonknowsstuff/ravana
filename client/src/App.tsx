@@ -1,5 +1,6 @@
 import { useState, useCallback, useRef, useEffect } from 'react'
 import { io, Socket } from 'socket.io-client'
+import { QRCodeSVG } from 'qrcode.react'
 import GLBViewer, { CameraData } from './GLBViewer'
 import { GLBData, extractGLBData } from './hooks/useGLBData'
 import { useCanvasExporter } from './hooks'
@@ -189,6 +190,19 @@ function App() {
   const [renderStartTime, setRenderStartTime] = useState<number | null>(null)
   const [renderElapsed, setRenderElapsed] = useState<string>('')
 
+  // Pending job state for retry mechanism
+  const [pendingJob, setPendingJob] = useState(false)
+  const [retryCountdown, setRetryCountdown] = useState(0)
+  const retryIntervalRef = useRef<number | null>(null)
+
+  // QR Code popup state
+  const [showQRPopup, setShowQRPopup] = useState(false)
+  const [copied, setCopied] = useState(false)
+  const workerUrl = `${window.location.origin}/worker`
+
+  // Developers popup state (hidden easter egg)
+  const [showDevPopup, setShowDevPopup] = useState(false)
+
   // fixed resolution for all renders
   const RENDER_WIDTH = 1280
   const RENDER_HEIGHT = 720
@@ -249,11 +263,94 @@ function App() {
     }
   }, [])
 
+  // Auto-send pending job when connection is established
+  useEffect(() => {
+    if (isConnected && pendingJob && glbData) {
+      console.log('[socket] Connection established, sending pending job...')
+      setPendingJob(false)
+      setRetryCountdown(0)
+      if (retryIntervalRef.current) {
+        clearInterval(retryIntervalRef.current)
+        retryIntervalRef.current = null
+      }
+      // Small delay to ensure socket is fully ready
+      setTimeout(() => {
+        handleSendToWorkers()
+      }, 100)
+    }
+  }, [isConnected, pendingJob, glbData])
+
+  // Keyboard shortcut for developers popup (Ctrl + Shift + K)
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.ctrlKey && e.shiftKey && e.key === 'K') {
+        e.preventDefault()
+        setShowDevPopup(prev => !prev)
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [])
+
+  // Update elapsed time during rendering
+  useEffect(() => {
+    if (!isRendering || renderStartTime === null) return
+
+    const updateElapsed = () => {
+      const elapsed = Date.now() - renderStartTime
+      const seconds = Math.floor(elapsed / 1000)
+      const minutes = Math.floor(seconds / 60)
+      const remainingSeconds = seconds % 60
+      setRenderElapsed(
+        minutes > 0
+          ? `${minutes}m ${remainingSeconds}s`
+          : `${seconds}s`
+      )
+    }
+
+    updateElapsed()
+    const interval = setInterval(updateElapsed, 1000)
+    return () => clearInterval(interval)
+  }, [isRendering, renderStartTime])
+
+  // Retry countdown timer
+  useEffect(() => {
+    if (pendingJob && !isConnected) {
+      setRetryCountdown(30)
+      retryIntervalRef.current = window.setInterval(() => {
+        setRetryCountdown(prev => {
+          if (prev <= 1) {
+            // Attempt reconnection
+            console.log('[socket] Retrying connection...')
+            socketRef.current?.connect()
+            return 30
+          }
+          return prev - 1
+        })
+      }, 1000)
+
+      return () => {
+        if (retryIntervalRef.current) {
+          clearInterval(retryIntervalRef.current)
+          retryIntervalRef.current = null
+        }
+      }
+    }
+  }, [pendingJob, isConnected])
+
   // Compile and send scene data to workers
   const handleSendToWorkers = useCallback(() => {
-    if (!glbData || !socketRef.current || !isConnected) return
+    if (!glbData || !socketRef.current) return
+
+    // If not connected, queue the job for retry
+    if (!isConnected) {
+      console.log('[socket] Not connected, queuing job for retry...')
+      setPendingJob(true)
+      return
+    }
 
     setIsSending(true)
+    setPendingJob(false) // Clear pending state since we're sending now
     try {
       const { metadata, buffer } = compileSceneData(glbData, savedCameraData)
       
@@ -305,6 +402,38 @@ function App() {
       setIsSending(false)
     }
   }, [glbData, savedCameraData, isConnected])
+
+  // Cancel pending job
+  const handleCancelPendingJob = useCallback(() => {
+    setPendingJob(false)
+    setRetryCountdown(0)
+    if (retryIntervalRef.current) {
+      clearInterval(retryIntervalRef.current)
+      retryIntervalRef.current = null
+    }
+  }, [])
+
+  // Copy worker URL to clipboard
+  const handleCopyUrl = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(workerUrl)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    } catch (err) {
+      console.error('Failed to copy:', err)
+    }
+  }, [workerUrl])
+
+  // Handle send button click - show QR popup then send
+  const handleSendClick = useCallback(() => {
+    setShowQRPopup(true)
+  }, [])
+
+  // Confirm send from popup
+  const handleConfirmSend = useCallback(() => {
+    setShowQRPopup(false)
+    handleSendToWorkers()
+  }, [handleSendToWorkers])
 
   const handleFileUpload = useCallback(async (file: File) => {
     if (file && (file.name.endsWith('.gltf') || file.name.endsWith('.glb'))) {
@@ -383,6 +512,54 @@ function App() {
             <div className="w-16 h-16 mx-auto border-4 border-purple-500 border-t-transparent rounded-full animate-spin mb-6"></div>
             <h2 className="text-2xl font-semibold text-white mb-2">Processing File</h2>
             <p className="text-slate-400">{bakingProgress || 'Loading...'}</p>
+          </div>
+        </div>
+      )}
+
+      {/* Waiting for Server Connection Overlay */}
+      {pendingJob && !isConnected && (
+        <div className="fixed inset-0 z-50 bg-slate-900/95 backdrop-blur-sm flex items-center justify-center">
+          <div className="text-center max-w-md mx-4">
+            {/* Animated connection icon */}
+            <div className="relative w-24 h-24 mx-auto mb-6">
+              <div className="absolute inset-0 border-4 border-cyan-500/30 rounded-full"></div>
+              <div className="absolute inset-0 border-4 border-cyan-500 border-t-transparent rounded-full animate-spin"></div>
+              <div className="absolute inset-4 bg-slate-800 rounded-full flex items-center justify-center">
+                <svg className="w-8 h-8 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 12h.01M12 12h.01M19 12h.01M6 12a1 1 0 11-2 0 1 1 0 012 0zm7 0a1 1 0 11-2 0 1 1 0 012 0zm7 0a1 1 0 11-2 0 1 1 0 012 0z" />
+                </svg>
+              </div>
+            </div>
+            
+            <h2 className="text-2xl font-semibold text-white mb-3">Waiting for Server</h2>
+            <p className="text-slate-400 mb-2">The server is starting up (Render free tier may take up to 60s)</p>
+            <p className="text-slate-500 text-sm mb-6">Your job will be sent automatically when connected</p>
+            
+            {/* Countdown timer */}
+            <div className="bg-slate-800/50 rounded-xl p-4 mb-6 border border-slate-700">
+              <div className="flex items-center justify-center space-x-3">
+                <div className="text-4xl font-mono font-bold text-cyan-400">{retryCountdown}</div>
+                <div className="text-left">
+                  <p className="text-slate-400 text-sm">seconds until</p>
+                  <p className="text-white font-medium">next retry</p>
+                </div>
+              </div>
+              {/* Progress bar */}
+              <div className="mt-3 h-1.5 bg-slate-700 rounded-full overflow-hidden">
+                <div 
+                  className="h-full bg-gradient-to-r from-cyan-500 to-purple-500 transition-all duration-1000"
+                  style={{ width: `${((30 - retryCountdown) / 30) * 100}%` }}
+                />
+              </div>
+            </div>
+            
+            {/* Cancel button */}
+            <button
+              onClick={handleCancelPendingJob}
+              className="px-6 py-2 bg-slate-700 text-slate-300 rounded-lg hover:bg-slate-600 transition-colors"
+            >
+              Cancel
+            </button>
           </div>
         </div>
       )}
@@ -586,6 +763,11 @@ function App() {
                   Distributed Render
                 </h2>
                 <div className="flex items-center space-x-4 text-sm">
+                  {renderElapsed && (
+                    <span className="text-cyan-400 font-mono">
+                      {renderElapsed}
+                    </span>
+                  )}
                   <span className="text-slate-400">
                     {tilesReceived} / {totalTiles} tiles
                   </span>
@@ -741,45 +923,43 @@ function App() {
 
         {/* Floating Send to Workers Button */}
         {glbData && (
-          <div className="sticky bottom-0 pb-6 z-50 flex justify-center pointer-events-none">
-            <div className="w-[40%] min-w-[320px] pointer-events-auto">
-              <div className={`flex items-center justify-between rounded-2xl px-6 py-5 shadow-lg shadow-cyan-500/20 transition-all duration-300 ${
-                isConnected && !isSending
+          <div className="sticky bottom-0 pb-4 z-50 flex justify-center pointer-events-none">
+            <div className="pointer-events-auto">
+              <div className={`flex items-center justify-between gap-8 rounded-xl px-5 py-3 shadow-lg shadow-cyan-500/20 transition-all duration-300 ${
+                !isSending && !pendingJob
                   ? 'bg-slate-800 border border-cyan-500/30'
                   : 'bg-slate-800 border border-slate-600'
               }`}>
                 {/* Status Side */}
-                <div className="flex flex-col space-y-1">
-                  <div className="flex items-center space-x-2">
-                    <div className={`w-3 h-3 rounded-full ${isConnected ? 'bg-green-500' : 'bg-red-500'}`} />
-                    <span className={`text-sm font-medium ${isConnected ? 'text-green-400' : 'text-red-400'}`}>
-                      {isConnected ? 'Connected' : 'Disconnected'}
-                    </span>
-                  </div>
-                  {lastSentPayload && (
-                    <p className="text-xs text-slate-500">
-                      Last: {lastSentPayload.geometry.meshCount} meshes, {lastSentPayload.geometry.totalVertices.toLocaleString()} verts
-                    </p>
-                  )}
+                <div className="flex items-center space-x-2">
+                  <div className={`w-2.5 h-2.5 rounded-full ${isConnected ? 'bg-green-500' : 'bg-red-500'}`} />
+                  <span className={`text-sm font-medium ${isConnected ? 'text-green-400' : 'text-red-400'}`}>
+                    {isConnected ? 'Connected' : 'Disconnected'}
+                  </span>
                 </div>
                 {/* Button */}
                 <button
-                  onClick={handleSendToWorkers}
-                  disabled={!isConnected || isSending}
-                  className={`px-8 py-3 rounded-xl font-semibold text-lg transition-all duration-300 flex items-center space-x-3 ${
-                    isConnected && !isSending
-                      ? 'bg-cyan-500 text-white hover:bg-cyan-400 hover:scale-105'
-                      : 'bg-slate-600 text-slate-400 cursor-not-allowed'
+                  onClick={handleSendClick}
+                  disabled={isSending || pendingJob}
+                  className={`px-5 py-2 rounded-lg font-medium text-sm transition-all duration-300 flex items-center space-x-2 ${
+                    isSending || pendingJob
+                      ? 'bg-slate-600 text-slate-400 cursor-not-allowed'
+                      : 'bg-cyan-500 text-white hover:bg-cyan-400 hover:scale-105'
                   }`}
                 >
                   {isSending ? (
                     <>
-                      <div className="w-6 h-6 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                      <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
                       <span>Sending...</span>
+                    </>
+                  ) : pendingJob ? (
+                    <>
+                      <div className="w-4 h-4 border-2 border-slate-400 border-t-transparent rounded-full animate-spin" />
+                      <span>Queued...</span>
                     </>
                   ) : (
                     <>
-                      <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
                       </svg>
                       <span>Send to Workers</span>
@@ -791,6 +971,117 @@ function App() {
           </div>
         )}
       </div>
+
+      {/* Developers Popup (Hidden - Ctrl + Shift + K) */}
+      {showDevPopup && (
+        <div className="fixed inset-0 z-[60] bg-black/70 backdrop-blur-sm flex items-center justify-center" onClick={() => setShowDevPopup(false)}>
+          <div 
+            className="bg-slate-800 rounded-2xl p-8 max-w-md mx-4 shadow-2xl shadow-purple-500/20 border border-purple-500/30"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="text-center">
+              <div className="w-16 h-16 mx-auto mb-4 rounded-full bg-purple-500/20 flex items-center justify-center">
+                <svg className="w-8 h-8 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4" />
+                </svg>
+              </div>
+              <h2 className="text-2xl font-bold text-white mb-2">Developers</h2>
+              <p className="text-slate-400 mb-6">The team behind Ravana</p>
+              
+              <div className="space-y-3">
+                <div className="bg-slate-700/50 rounded-lg p-4 border border-slate-600">
+                  <span className="text-white font-medium">Simon P Binu</span>
+                </div>
+                <div className="bg-slate-700/50 rounded-lg p-4 border border-slate-600">
+                  <span className="text-white font-medium">Seraphin J Raphy</span>
+                </div>
+                <div className="bg-slate-700/50 rounded-lg p-4 border border-slate-600">
+                  <span className="text-white font-medium">Johan Abraham</span>
+                </div>
+              </div>
+              
+              <button
+                onClick={() => setShowDevPopup(false)}
+                className="mt-6 px-6 py-2 bg-purple-500 text-white rounded-lg hover:bg-purple-400 transition-colors font-medium"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* QR Code Popup */}
+      {showQRPopup && (
+        <div className="fixed inset-0 z-[60] bg-black/70 backdrop-blur-sm flex items-center justify-center" onClick={() => setShowQRPopup(false)}>
+          <div 
+            className="bg-slate-800 rounded-2xl p-8 max-w-md mx-4 shadow-2xl shadow-cyan-500/20 border border-cyan-500/30"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="text-center">
+              <h2 className="text-2xl font-bold text-white mb-2">Invite Workers</h2>
+              <p className="text-slate-400 mb-6">Share this QR code or link to add render workers</p>
+              
+              {/* QR Code */}
+              <div className="bg-white p-4 rounded-xl inline-block mb-4">
+                <QRCodeSVG
+                  value={workerUrl}
+                  size={180}
+                  level="M"
+                />
+              </div>
+              
+              {/* URL with copy button */}
+              <div className="flex items-center bg-slate-900 rounded-lg p-3 mb-6">
+                <span className="text-cyan-400 text-sm font-mono flex-1 truncate mr-2">{workerUrl}</span>
+                <button
+                  onClick={handleCopyUrl}
+                  className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-all ${
+                    copied
+                      ? 'bg-green-500 text-white'
+                      : 'bg-cyan-500 text-white hover:bg-cyan-400'
+                  }`}
+                >
+                  {copied ? (
+                    <span className="flex items-center space-x-1">
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                      </svg>
+                      <span>Copied!</span>
+                    </span>
+                  ) : (
+                    <span className="flex items-center space-x-1">
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                      </svg>
+                      <span>Copy</span>
+                    </span>
+                  )}
+                </button>
+              </div>
+              
+              {/* Action buttons */}
+              <div className="flex space-x-3">
+                <button
+                  onClick={() => setShowQRPopup(false)}
+                  className="flex-1 px-4 py-3 bg-slate-700 text-slate-300 rounded-xl hover:bg-slate-600 transition-colors font-medium"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleConfirmSend}
+                  className="flex-1 px-4 py-3 bg-cyan-500 text-white rounded-xl hover:bg-cyan-400 transition-colors font-medium flex items-center justify-center space-x-2"
+                >
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                  </svg>
+                  <span>Start Render</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Footer */}
       <footer className="bg-slate-900 border-t border-white/10 py-8 relative z-10">
