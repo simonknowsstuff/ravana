@@ -1,457 +1,160 @@
-/**
- * SHARD NODE WORKER — Multi-light raytracer with PBR (Metallic/Roughness) & Textures
- */
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js';
+import { WebGLPathTracer } from 'three-gpu-pathtracer';
 
-interface Vector3 { x: number; y: number; z: number; }
+// @ts-ignore - for worker scope
+const _self = self as any;
+globalThis.length = 0; // Polyfill for three-gpu-pathtracer bug that assumes `window.length` exists!
 
-interface LightDef {
-  type: 'point' | 'directional' | 'spot';
-  position: Vector3;
-  direction: Vector3;
-  color: { r: number; g: number; b: number };
-  intensity: number;
-  distance: number;   // 0 = infinite range
-  decay: number;
-  angle: number;       // spot half-angle (radians)
-  penumbra: number;    // spot penumbra 0-1
-}
+let renderer: THREE.WebGLRenderer | null = null;
+let pathTracer: WebGLPathTracer | null = null;
+let currentCamera: THREE.PerspectiveCamera | null = null;
+let currentScene: THREE.Scene | null = null;
+let currentFileUrl: string | null = null;
 
-interface WorkerPayload {
-  type?: 'init_geometry' | 'render_tile';
-  positions: Float32Array;
-  bvhBuffer: Float32Array;
-  indices: Uint32Array;
-  colors?: Float32Array;
-  normals?: Float32Array;
-  emissive?: Float32Array;
-  ao?: Float32Array;
-  
-  uvs?: Float32Array;
-  textureIndices?: Float32Array;
-  roughness?: Float32Array;
-  metallic?: Float32Array;
-  ormTextureIndices?: Float32Array;
-  emissiveTextureIndices?: Float32Array;
-  textures?: { width: number, height: number, pixels: Uint8Array }[];
-  
-  lights?: LightDef[];
-  startX: number; startY: number; width: number; height: number;
-  canvasWidth: number; canvasHeight: number;
-  fov?: number;
-  cameraPos?: Vector3; viewMatrix?: number[]; sunDir?: Vector3;
-  camera?: { cameraPos?: Vector3; viewMatrix?: number[]; fov?: number; sunDir?: Vector3; };
-}
+_self.onmessage = async (event: MessageEvent) => {
+  const data = event.data;
 
-const BVH_NODE_SIZE = 10;
-const SHADOW_EPSILON = 0.005;
+  if (data.type === 'render_tile') {
+    const {
+      fileUrl,
+      startX, startY, width, height,
+      canvasWidth, canvasHeight,
+      camera: camData
+    } = data;
 
-// ── GLOBAL WORKER STATE ───────────────────────────────────────────
-let positions: Float32Array | null = null;
-let bvhBuffer: Float32Array | null = null;
-let indices: Uint32Array | null = null;
-let colors: Float32Array | undefined;
-let normals: Float32Array | undefined;
-let emissive: Float32Array | undefined;
-let ao: Float32Array | undefined;
-
-let uvs: Float32Array | undefined;
-let textureIndices: Float32Array | undefined;
-let roughnessArray: Float32Array | undefined;
-let metallicArray: Float32Array | undefined;
-let ormTextureIndices: Float32Array | undefined;
-let emissiveTextureIndices: Float32Array | undefined;
-let textures: { width: number, height: number, pixels: Uint8Array }[] = [];
-
-// ── BILINEAR TEXTURE SAMPLER ──
-function sampleTextureBilinear(tex: { width: number, height: number, pixels: Uint8Array }, u: number, v: number, isSRGB: boolean) {
-  let u_wrap = u - Math.floor(u);
-  let v_wrap = v - Math.floor(v); // GLTF and Canvas share the same top-left origin!
-
-  const u_img = u_wrap * tex.width - 0.5;
-  const v_img = v_wrap * tex.height - 0.5;
-
-  const x0 = Math.max(0, Math.floor(u_img));
-  const y0 = Math.max(0, Math.floor(v_img));
-  const x1 = Math.min(tex.width - 1, x0 + 1);
-  const y1 = Math.min(tex.height - 1, y0 + 1);
-
-  const frac_x = u_img - Math.floor(u_img);
-  const frac_y = v_img - Math.floor(v_img);
-
-  const getPixel = (px: number, py: number) => {
-    const idx = (py * tex.width + px) * 4;
-    let r = tex.pixels[idx] / 255.0;
-    let g = tex.pixels[idx + 1] / 255.0;
-    let b = tex.pixels[idx + 2] / 255.0;
-    
-    // Convert sRGB color textures to linear space for accurate light math
-    if (isSRGB) {
-      r = Math.pow(r, 2.2); g = Math.pow(g, 2.2); b = Math.pow(b, 2.2);
+    // 1. Initialize WebGL on OffscreenCanvas
+    if (!renderer) {
+      const canvas = new OffscreenCanvas(width, height);
+      const gl = canvas.getContext('webgl2', { antialias: false, preserveDrawingBuffer: false }) as WebGL2RenderingContext;
+      
+      renderer = new THREE.WebGLRenderer({ canvas, context: gl });
+      renderer.setPixelRatio(1);
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      
+      pathTracer = new WebGLPathTracer(renderer);
+      // Fast quality settings
+      pathTracer.bounces = 3;
+      pathTracer.tiles.set(1, 1);
+      pathTracer.renderScale = 1;
+      
+      currentScene = new THREE.Scene();
+      // Add a simple environment
+      currentScene.background = new THREE.Color(0x1a1a20);
+      const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+      currentScene.add(ambientLight);
+      const dirLight = new THREE.DirectionalLight(0xffffff, 2);
+      dirLight.position.set(5, 10, 5);
+      currentScene.add(dirLight);
     }
-    return { r, g, b };
-  };
 
-  const p00 = getPixel(x0, y0); const p10 = getPixel(x1, y0);
-  const p01 = getPixel(x0, y1); const p11 = getPixel(x1, y1);
+    // Fix context sizing for this exact tile
+    // WebGLRenderer resets target if we resize canvas, so we do it
+    renderer.setSize(width, height, false);
 
-  const c0r = p00.r * (1 - frac_x) + p10.r * frac_x;
-  const c0g = p00.g * (1 - frac_x) + p10.g * frac_x;
-  const c0b = p00.b * (1 - frac_x) + p10.b * frac_x;
-  
-  const c1r = p01.r * (1 - frac_x) + p11.r * frac_x;
-  const c1g = p01.g * (1 - frac_x) + p11.g * frac_x;
-  const c1b = p01.b * (1 - frac_x) + p11.b * frac_x;
+    // 2. Load GLB Model if it's new
+    if (fileUrl !== currentFileUrl && currentScene) {
+      try {
+        console.log(`[Worker] Loading model via HTTP: ${fileUrl}`);
+        const loader = new GLTFLoader();
+        
+        // Add DRACO loader in case the GLB uses Draco mesh compression
+        const dracoLoader = new DRACOLoader();
+        dracoLoader.setDecoderPath('https://www.gstatic.com/draco/versioned/decoders/1.5.7/');
+        loader.setDRACOLoader(dracoLoader);
+        
+        // Remove old models if any
+        const objectsToRemove: THREE.Object3D[] = [];
+        currentScene.children.forEach(c => {
+          if (c.userData.isModel) objectsToRemove.push(c);
+        });
+        objectsToRemove.forEach(o => currentScene!.remove(o));
 
-  return {
-    r: c0r * (1 - frac_y) + c1r * frac_y,
-    g: c0g * (1 - frac_y) + c1g * frac_y,
-    b: c0b * (1 - frac_y) + c1b * frac_y
-  };
-}
+        const gltf = await loader.loadAsync(fileUrl);
+        gltf.scene.userData.isModel = true;
+        
+        // Ensure materials are DoubleSide for better pathtracing robustness
+        gltf.scene.traverse((c) => {
+          if ((c as THREE.Mesh).isMesh) {
+            const m = (c as THREE.Mesh).material;
+            if (m) (m as THREE.Material).side = THREE.DoubleSide;
+          }
+        });
 
-self.onmessage = (event: MessageEvent<WorkerPayload | any>) => {
-  const { type } = event.data;
-
-  // ── 1. INITIALIZE GEOMETRY ─────────────────────────────────────
-  if (type === 'init_geometry') {
-    positions = event.data.positions;
-    bvhBuffer = event.data.bvhBuffer;
-    indices = event.data.indices;
-    colors = event.data.colors;
-    normals = event.data.normals;
-    emissive = event.data.emissive;
-    ao = event.data.ao;
-    
-    uvs = event.data.uvs;
-    textureIndices = event.data.textureIndices;
-    roughnessArray = event.data.roughness;
-    metallicArray = event.data.metallic;
-    ormTextureIndices = event.data.ormTextureIndices;
-    emissiveTextureIndices = event.data.emissiveTextureIndices;
-    textures = event.data.textures || [];
-    
-    console.log(`[Worker-Web] Geometry primed: ${positions!.length / 3} verts, ${textures.length} textures.`);
-    return;
-  }
-
-  // ── 2. RENDER TILE ─────────────────────────────────────────────
-  let { startX, startY, width, height, canvasWidth, canvasHeight, lights } = event.data;
-  let cameraPos: Vector3, viewMatrix: number[], sunDir: Vector3, fov: number;
-
-  if (event.data.camera) {
-    ({ cameraPos, viewMatrix, fov, sunDir } = event.data.camera);
-  } else {
-    ({ cameraPos, viewMatrix, fov, sunDir } = event.data);
-  }
-
-  if (!positions || !bvhBuffer || !indices) {
-    console.warn(`[Worker-Web] Dropped tile [${startX}, ${startY}]: Geometry not initialized.`);
-    return;
-  }
-
-  lights = lights || [];
-  if (!viewMatrix) viewMatrix = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
-  if (!cameraPos) cameraPos = { x: 0, y: 0, z: 0 };
-  if (!sunDir) sunDir = { x: 0, y: 1, z: 0 };
-  sunDir = normalize(sunDir);
-  if (!fov || fov <= 0) fov = 50;
-
-  function isOccluded(origin: Vector3, dir: Vector3, maxDist: number): boolean {
-    const stack = new Uint32Array(64);
-    let stackPtr = 0;
-    stack[stackPtr++] = 0;
-    let steps = 0;
-    while (stackPtr > 0) {
-      if (steps++ > 10000) break;
-      const nodeIdx = stack[--stackPtr];
-      const base = nodeIdx * BVH_NODE_SIZE;
-      if (!intersectBox(origin, dir, bvhBuffer!, base)) continue;
-      const isLeaf = bvhBuffer![base + 9] !== 0;
-      if (isLeaf) {
-        const off = bvhBuffer![base + 7], cnt = bvhBuffer![base + 8];
-        for (let i = off; i < off + cnt; i++) {
-          const i3 = i * 3;
-          const aIdx = indices![i3] * 3, bIdx = indices![i3 + 1] * 3, cIdx = indices![i3 + 2] * 3;
-          const t = intersectTriangle(
-            origin, dir,
-            { x: positions![aIdx], y: positions![aIdx + 1], z: positions![aIdx + 2] },
-            { x: positions![bIdx], y: positions![bIdx + 1], z: positions![bIdx + 2] },
-            { x: positions![cIdx], y: positions![cIdx + 1], z: positions![cIdx + 2] }
-          );
-          if (t !== null && t > SHADOW_EPSILON && t < maxDist) return true;
-        }
-      } else {
-        stack[stackPtr++] = nodeIdx + 1;
-        stack[stackPtr++] = bvhBuffer![base + 6];
+        currentScene.add(gltf.scene);
+        currentFileUrl = fileUrl;
+        
+        console.log(`[Worker] Model Loaded. Updating PathTracer Scene...`);
+        // We set scene below
+      } catch (err) {
+        console.error("[Worker] GLB Load Error:", err);
+        return; // drop tile
       }
     }
-    return false;
-  }
 
-  const pixels = new Uint8ClampedArray(width * height * 4);
-  const mainStack = new Uint32Array(64);
-  let pixelIdx = 0;
+    // 3. Update Camera
+    if (!currentCamera) {
+      currentCamera = new THREE.PerspectiveCamera(camData?.fov || 50, canvasWidth / canvasHeight, 0.1, 1000);
+    }
+    
+    currentCamera.aspect = canvasWidth / canvasHeight;
+    // Set position and view matrix
+    if (camData?.cameraPos) {
+      currentCamera.position.set(camData.cameraPos.x, camData.cameraPos.y, camData.cameraPos.z);
+    }
+    if (camData?.viewMatrix) {
+      currentCamera.matrixAutoUpdate = false;
+      currentCamera.matrixWorld.fromArray(camData.viewMatrix);
+    } else {
+      currentCamera.updateMatrixWorld();
+    }
+    
+    // THE SECRET SAUCE: Tell the camera to only render THIS TILE
+    currentCamera.setViewOffset(canvasWidth, canvasHeight, startX, startY, width, height);
+    currentCamera.updateProjectionMatrix();
 
-  for (let y = startY; y < startY + height; y++) {
-    for (let x = startX; x < startX + width; x++) {
-      const rd = getRayDirection(x, y, canvasWidth, canvasHeight, viewMatrix, fov);
-      let closestT = Infinity;
-      let hitNormal: Vector3 = { x: 0, y: 0, z: 0 };
-      let hitVertA = 0;
-      let hitU = 0, hitV = 0;
-      let hitA = 0, hitB = 0, hitC = 0;
+    // 4. Update PathTracer
+    if (pathTracer && currentScene && currentCamera) {
+      // setScene builds the BVH if scene changed.
+      pathTracer.setScene(currentScene, currentCamera);
+      pathTracer.updateCamera();
 
-      let stackPtr = 0;
-      mainStack[stackPtr++] = 0;
-      let safety = 0;
-      while (stackPtr > 0) {
-        if (safety++ > 10000) break;
-        const nodeIdx = mainStack[--stackPtr];
-        const base = nodeIdx * BVH_NODE_SIZE;
-        if (!intersectBox(cameraPos, rd, bvhBuffer!, base)) continue;
-        const isLeaf = bvhBuffer![base + 9] !== 0;
-        if (isLeaf) {
-          const off = bvhBuffer![base + 7], cnt = bvhBuffer![base + 8];
-          for (let i = off; i < off + cnt; i++) {
-            const i3 = i * 3;
-            const aIdx = indices![i3] * 3, bIdx = indices![i3 + 1] * 3, cIdx = indices![i3 + 2] * 3;
-            const hit = intersectTriangleBary(
-              cameraPos, rd,
-              { x: positions![aIdx], y: positions![aIdx + 1], z: positions![aIdx + 2] },
-              { x: positions![bIdx], y: positions![bIdx + 1], z: positions![bIdx + 2] },
-              { x: positions![cIdx], y: positions![cIdx + 1], z: positions![cIdx + 2] }
-            );
-            if (hit !== null && hit.t < closestT) {
-              closestT = hit.t;
-              hitU = hit.u;
-              hitV = hit.v;
-              hitA = aIdx; hitB = bIdx; hitC = cIdx;
-              hitVertA = indices![i3];
-              hitNormal = calculateNormal(positions!, aIdx, bIdx, cIdx);
-            }
-          }
-        } else {
-          mainStack[stackPtr++] = nodeIdx + 1;
-          mainStack[stackPtr++] = bvhBuffer![base + 6];
-        }
+      // Reset accumulation
+      pathTracer.reset();
+
+      // 5. Render N samples
+      const SAMPLES = 25; // Good balance for web workers
+      for (let i = 0; i < SAMPLES; i++) {
+        pathTracer.renderSample();
       }
 
-      if (closestT < Infinity) {
-        const hitP: Vector3 = {
-          x: cameraPos.x + rd.x * closestT,
-          y: cameraPos.y + rd.y * closestT,
-          z: cameraPos.z + rd.z * closestT,
-        };
+      // 6. Read Pixels out of the render target
+      const readBuffer = new Uint8Array(width * height * 4);
+      
+      // WebGLPathTracer renders to the canvas by default (renderToCanvas=true),
+      // which automatically tone-maps the internal float buffers to Uint8 for display.
+      // We can directly capture this resulting RGBA Uint8 byte array!
+      const gl = renderer.getContext();
+      gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, readBuffer);
 
-        const w0 = 1 - hitU - hitV;
-        const w1 = hitU;
-        const w2 = hitV;
-
-        let shadingNormal = hitNormal;
-        if (normals && normals.length > 0) {
-          const nA: Vector3 = { x: normals[hitA], y: normals[hitA + 1], z: normals[hitA + 2] };
-          const nB: Vector3 = { x: normals[hitB], y: normals[hitB + 1], z: normals[hitB + 2] };
-          const nC: Vector3 = { x: normals[hitC], y: normals[hitC + 1], z: normals[hitC + 2] };
-          shadingNormal = normalize({
-            x: w0 * nA.x + w1 * nB.x + w2 * nC.x,
-            y: w0 * nA.y + w1 * nB.y + w2 * nC.y,
-            z: w0 * nA.z + w1 * nB.z + w2 * nC.z,
-          });
-        }
-
-        const geoN = dot(hitNormal, rd) > 0 ? { x: -hitNormal.x, y: -hitNormal.y, z: -hitNormal.z } : hitNormal;
-        const N = dot(shadingNormal, rd) > 0 ? { x: -shadingNormal.x, y: -shadingNormal.y, z: -shadingNormal.z } : shadingNormal;
-
-        const vertIndexA = hitA / 3;
-        let u = 0, v = 0;
-        
-        if (uvs && uvs.length > 0) {
-          const uvIdxA = vertIndexA * 2;
-          const uvIdxB = (hitB / 3) * 2;
-          const uvIdxC = (hitC / 3) * 2;
-          u = w0 * uvs[uvIdxA] + w1 * uvs[uvIdxB] + w2 * uvs[uvIdxC];
-          v = w0 * uvs[uvIdxA + 1] + w1 * uvs[uvIdxB + 1] + w2 * uvs[uvIdxC + 1];
-        }
-
-        // ── 1. Diffuse Color ──
-        let albR = 0.78, albG = 0.78, albB = 0.78;
-        const diffuseIdx = (textureIndices && textureIndices.length > 0) ? textureIndices[vertIndexA] : -1;
-        
-        if (diffuseIdx >= 0 && diffuseIdx < textures.length) {
-          const colorSample = sampleTextureBilinear(textures[diffuseIdx], u, v, true);
-          albR = colorSample.r; albG = colorSample.g; albB = colorSample.b;
-        } else if (colors && colors.length > 0) {
-          const ci = hitVertA * 3;
-          albR = colors[ci]; albG = colors[ci + 1]; albB = colors[ci + 2];
-        }
-
-        // ── 2. PBR Properties (ORM) ──
-        let roughness = (roughnessArray && roughnessArray.length > 0) ? roughnessArray[vertIndexA] : 0.5;
-        let metallic = (metallicArray && metallicArray.length > 0) ? metallicArray[vertIndexA] : 0.0;
-        let aoFactor = (ao && ao.length > 0) ? ao[hitVertA] : 1.0;
-        
-        const ormIdx = (ormTextureIndices && ormTextureIndices.length > 0) ? ormTextureIndices[vertIndexA] : -1;
-        if (ormIdx >= 0 && ormIdx < textures.length) {
-          // False = Do not gamma correct ORM data!
-          const ormSample = sampleTextureBilinear(textures[ormIdx], u, v, false);
-          
-          // GLTF ORM: R=AO, G=Roughness, B=Metallic
-          aoFactor *= ormSample.r; 
-          roughness *= ormSample.g;
-          metallic *= ormSample.b;
-        }
-        
-        // Clamp to physics-safe values
-        roughness = Math.max(0.04, Math.min(1.0, roughness));
-        metallic = Math.max(0.0, Math.min(1.0, metallic));
-        
-        // F0 is the base reflectivity.
-        const F0 = metallic > 0.5 ? { r: albR, g: albG, b: albB } : { r: 0.04, g: 0.04, b: 0.04 };
-
-        let totalR = 0, totalG = 0, totalB = 0;
-        const ambientStrength = 0.15 * aoFactor;
-        totalR += albR * ambientStrength;
-        totalG += albG * ambientStrength;
-        totalB += albB * ambientStrength;
-
-        // ── 3. Lighting Math ──
-        for (const light of lights) {
-          let L: Vector3, lightDist: number, attenuation = 1.0, spotFactor = 1.0;
-          if (light.type === 'directional') {
-            L = normalize({ x: -light.direction.x, y: -light.direction.y, z: -light.direction.z });
-            lightDist = 1e6;
-            // Directional lights shouldn't be insanely bright in our simple model
-            attenuation = Math.min(light.intensity, 3.0); 
-          } else {
-            const toLight = sub(light.position, hitP);
-            lightDist = Math.sqrt(dot(toLight, toLight));
-            L = { x: toLight.x / lightDist, y: toLight.y / lightDist, z: toLight.z / lightDist };
-            
-            // Standard inverse-square falloff, clamped to prevent blowing out when light is very close to surface
-            const distanceSquare = Math.max(0.1, dot(toLight, toLight));
-            attenuation = light.distance > 0 && lightDist > light.distance ? 0 : light.intensity / distanceSquare;
-            
-            if (light.type === 'spot') {
-              const cosAngle = -dot(L, normalize(light.direction));
-              const cosCone = Math.cos(light.angle), cosPenumbra = Math.cos(light.angle * (1 - light.penumbra));
-              spotFactor = cosAngle < cosCone ? 0 : cosAngle < cosPenumbra ? Math.pow((cosAngle - cosCone) / (cosPenumbra - cosCone), 2) : 1;
-            }
-          }
-          if (attenuation * spotFactor < 0.001) continue;
-          
-          const NdotL = Math.max(0, dot(N, L));
-          if (NdotL <= 0) continue;
-          
-          // Shadow Ray
-          if (isOccluded({ x: hitP.x + geoN.x * SHADOW_EPSILON, y: hitP.y + geoN.y * SHADOW_EPSILON, z: hitP.z + geoN.z * SHADOW_EPSILON }, L, lightDist)) continue;
-
-          const V = normalize(sub(cameraPos, hitP));
-          const H = normalize({ x: L.x + V.x, y: L.y + V.y, z: L.z + V.z });
-          
-          const NdotH = Math.max(0.001, dot(N, H));
-          const VdotH = Math.max(0.001, dot(V, H));
-          const NdotV = Math.max(0.001, dot(N, V));
-          
-          // GGX Specular - clamped roughness to prevent divide-by-zero explosions
-          const safeRoughness = Math.max(0.08, roughness); 
-          const alpha2 = Math.pow(safeRoughness * safeRoughness, 2);
-          const D = alpha2 / (Math.pow(NdotH * NdotH * (alpha2 - 1.0) + 1.0, 2) * Math.PI);
-          
-          const fresnel = (a: number) => a + (1.0 - a) * Math.pow(Math.max(0, 1.0 - VdotH), 5.0);
-          const F = { r: fresnel(F0.r), g: fresnel(F0.g), b: fresnel(F0.b) };
-          
-          const k = Math.pow(safeRoughness + 1.0, 2) / 8.0;
-          const G = 1.0 / (NdotV * (1.0 - k) + k) / (NdotL * (1.0 - k) + k);
-          
-          // Calculate specular with a safety clamp to prevent infinite spikes
-          const denominator = Math.max(0.001, 4.0 * NdotV * NdotL);
-          let specBrdfR = Math.min(10.0, (D * F.r * G) / denominator);
-          let specBrdfG = Math.min(10.0, (D * F.g * G) / denominator);
-          let specBrdfB = Math.min(10.0, (D * F.b * G) / denominator);
-
-          // Energy conservation: diffuse light is whatever light WASN'T reflected as specular
-          const kD_r = (1.0 - F.r) * (1.0 - metallic);
-          const kD_g = (1.0 - F.g) * (1.0 - metallic);
-          const kD_b = (1.0 - F.b) * (1.0 - metallic);
-
-          // Combine Diffuse and Specular, multiply by light intensity and angle
-          const radiance = attenuation * spotFactor * NdotL;
-
-          totalR += ((albR * kD_r) / Math.PI + specBrdfR) * light.color.r * radiance;
-          totalG += ((albG * kD_g) / Math.PI + specBrdfG) * light.color.g * radiance;
-          totalB += ((albB * kD_b) / Math.PI + specBrdfB) * light.color.b * radiance;
-        }
-
-        // ── 4. Emissive Texture (The Glowing Blue Visor!) ──
-        let emiR = 0, emiG = 0, emiB = 0;
-        const emiIdx = (emissiveTextureIndices && emissiveTextureIndices.length > 0) ? emissiveTextureIndices[vertIndexA] : -1;
-        
-        if (emiIdx >= 0 && emiIdx < textures.length) {
-          // Sample the glowing texture (sRGB = true)
-          const emiSample = sampleTextureBilinear(textures[emiIdx], u, v, true);
-          emiR = emiSample.r; emiG = emiSample.g; emiB = emiSample.b;
-        } else if (emissive && emissive.length > 0) {
-          // Fallback to flat material glow
-          const ei = hitVertA * 3;
-          if (ei + 2 < emissive.length) {
-            emiR = emissive[ei]; emiG = emissive[ei + 1]; emiB = emissive[ei + 2];
-          }
-        }
-
-        // Add the glow to the final pixel color (independent of external lighting)
-        totalR += emiR * 5.0;
-        totalG += emiG * 5.0;
-        totalB += emiB * 5.0;
-
-        // ACES Tone mapping & Gamma Correction
-        const aces = (v: number) => (v * (2.51 * v + 0.03)) / (v * (2.43 * v + 0.59) + 0.14);
-        pixels[pixelIdx++] = Math.min(255, Math.max(0, Math.round(Math.pow(aces(totalR), 1 / 2.2) * 255)));
-        pixels[pixelIdx++] = Math.min(255, Math.max(0, Math.round(Math.pow(aces(totalG), 1 / 2.2) * 255)));
-        pixels[pixelIdx++] = Math.min(255, Math.max(0, Math.round(Math.pow(aces(totalB), 1 / 2.2) * 255)));
-        pixels[pixelIdx++] = 255;
-      } else {
-        pixels[pixelIdx++] = 18; pixels[pixelIdx++] = 18; pixels[pixelIdx++] = 20; pixels[pixelIdx++] = 255;
+      // WebGL reads bottom-up. Canvas expects top-down. We MUST flip Y!
+      const flippedBuffer = new Uint8ClampedArray(width * height * 4);
+      const rowBytes = width * 4;
+      for (let r = 0; r < height; r++) {
+        const srcOffset = (height - 1 - r) * rowBytes;
+        const dstOffset = r * rowBytes;
+        flippedBuffer.set(readBuffer.subarray(srcOffset, srcOffset + rowBytes), dstOffset);
       }
+
+      // 7. Send back
+      _self.postMessage({
+        buffer: flippedBuffer.buffer, 
+        startX, 
+        startY, 
+        width, 
+        height
+      }, [flippedBuffer.buffer]);
     }
   }
-  self.postMessage({ buffer: pixels.buffer, startX, startY, width, height }, [pixels.buffer] as any);
 };
-
-// --- MATH HELPERS ---
-const dot = (a: Vector3, b: Vector3): number => a.x * b.x + a.y * b.y + a.z * b.z;
-const cross = (a: Vector3, b: Vector3): Vector3 => ({ x: a.y * b.z - a.z * b.y, y: a.z * b.x - a.x * b.z, z: a.x * b.y - a.y * b.x });
-const sub = (a: Vector3, b: Vector3): Vector3 => ({ x: a.x - b.x, y: a.y - b.y, z: a.z - b.z });
-const normalize = (v: Vector3): Vector3 => { const l = Math.sqrt(dot(v, v)); return { x: v.x / l, y: v.y / l, z: v.z / l }; };
-const calculateNormal = (pos: Float32Array, a: number, b: number, c: number): Vector3 => normalize(cross(sub({ x: pos[b], y: pos[b + 1], z: pos[b + 2] }, { x: pos[a], y: pos[a + 1], z: pos[a + 2] }), sub({ x: pos[c], y: pos[c + 1], z: pos[c + 2] }, { x: pos[a], y: pos[a + 1], z: pos[a + 2] })));
-function getRayDirection(x: number, y: number, w: number, h: number, m: number[], fov: number): Vector3 {
-  const aspect = w / h, halfTan = Math.tan(fov * Math.PI / 360);
-  const nx = ((x + 0.5) / w * 2 - 1) * aspect * halfTan, ny = (1 - (y + 0.5) / h * 2) * halfTan;
-  return normalize({ x: m[0] * nx + m[4] * ny - m[8], y: m[1] * nx + m[5] * ny - m[9], z: m[2] * nx + m[6] * ny - m[10] });
-}
-function intersectBox(ro: Vector3, rd: Vector3, bvh: Float32Array, base: number): boolean {
-  let tmin = -Infinity, tmax = Infinity;
-  for (let i = 0; i < 3; i++) {
-    const invD = 1.0 / (i === 0 ? rd.x : i === 1 ? rd.y : rd.z);
-    const t1 = (bvh[base + i] - (i === 0 ? ro.x : i === 1 ? ro.y : ro.z)) * invD, t2 = (bvh[base + i + 3] - (i === 0 ? ro.x : i === 1 ? ro.y : ro.z)) * invD;
-    tmin = Math.max(tmin, Math.min(t1, t2)); tmax = Math.min(tmax, Math.max(t1, t2));
-  }
-  return tmax >= tmin && tmax > 0;
-}
-function intersectTriangle(ro: Vector3, rd: Vector3, v0: Vector3, v1: Vector3, v2: Vector3): number | null {
-  const e1 = sub(v1, v0), e2 = sub(v2, v0), h = cross(rd, e2), a = dot(e1, h);
-  if (Math.abs(a) < 1e-5) return null;
-  const f = 1.0 / a, s = sub(ro, v0), u = f * dot(s, h);
-  if (u < 0 || u > 1) return null;
-  const q = cross(s, e1), v = f * dot(rd, q);
-  if (v < 0 || u + v > 1) return null;
-  const t = f * dot(e2, q); return t > 1e-5 ? t : null;
-}
-function intersectTriangleBary(ro: Vector3, rd: Vector3, v0: Vector3, v1: Vector3, v2: Vector3): { t: number; u: number; v: number } | null {
-  const e1 = sub(v1, v0), e2 = sub(v2, v0), h = cross(rd, e2), a = dot(e1, h);
-  if (Math.abs(a) < 1e-5) return null;
-  const f = 1.0 / a, s = sub(ro, v0), u = f * dot(s, h);
-  if (u < 0 || u > 1) return null;
-  const q = cross(s, e1), v = f * dot(rd, q);
-  if (v < 0 || u + v > 1) return null;
-  const t = f * dot(e2, q); return t > 1e-5 ? { t, u, v } : null;
-}
